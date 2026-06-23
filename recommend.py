@@ -99,14 +99,11 @@ def _build_rule_dict(rules_df, val_col):
                 rule_map[alias] = (orig_name, val)
     return rule_map
 
-def _analisis_produk(produk: pd.Series, rules_cocok: pd.DataFrame, rules_tidak: pd.DataFrame) -> dict:
+def _analisis_produk(produk: pd.Series, cocok_map: dict, tidak_map: dict, cache_cocok: dict, cache_tidak: dict, cocok_keys: list, tidak_keys: list) -> dict:
     ingredients_list = _parse_ingredients(produk.get('Ingridients', ''))
     total = len(ingredients_list)
     if total == 0:
         return None
-
-    cocok_map = _build_rule_dict(rules_cocok, 'Manfaat' if 'Manfaat' in rules_cocok.columns else 'None')
-    tidak_map = _build_rule_dict(rules_tidak, 'Efek_Samping' if 'Efek_Samping' in rules_tidak.columns else 'None')
 
     cocok_found, tidak_found = [], []
     ingredients_detail = []
@@ -126,10 +123,15 @@ def _analisis_produk(produk: pd.Series, rules_cocok: pd.DataFrame, rules_tidak: 
         if not match_cocok:
             # 2. Cek Fuzzy Match
             for a in k_aliases:
-                fuzz = get_close_matches(a, cocok_map.keys(), n=1, cutoff=0.85)
-                if fuzz: 
-                    match_cocok = fuzz[0]
-                    break
+                if a in cache_cocok:
+                    match_cocok = cache_cocok[a]
+                    if match_cocok: break
+                else:
+                    fuzz = get_close_matches(a, cocok_keys, n=1, cutoff=0.85)
+                    cache_cocok[a] = fuzz[0] if fuzz else None
+                    if fuzz: 
+                        match_cocok = fuzz[0]
+                        break
             
         if match_cocok:
             orig_name, manfaat = cocok_map[match_cocok]
@@ -148,10 +150,15 @@ def _analisis_produk(produk: pd.Series, rules_cocok: pd.DataFrame, rules_tidak: 
         if not match_tidak:
             # 2. Cek Fuzzy Match
             for a in k_aliases:
-                fuzz = get_close_matches(a, tidak_map.keys(), n=1, cutoff=0.85)
-                if fuzz: 
-                    match_tidak = fuzz[0]
-                    break
+                if a in cache_tidak:
+                    match_tidak = cache_tidak[a]
+                    if match_tidak: break
+                else:
+                    fuzz = get_close_matches(a, tidak_keys, n=1, cutoff=0.85)
+                    cache_tidak[a] = fuzz[0] if fuzz else None
+                    if fuzz: 
+                        match_tidak = fuzz[0]
+                        break
             
         if match_tidak:
             orig_name, efek = tidak_map[match_tidak]
@@ -250,9 +257,17 @@ def get_recommendations():
     if produk_filter.empty:
         return jsonify({'results': [], 'total': 0, 'kategori': kategori}), 200
 
+    cocok_map = _build_rule_dict(rules_cocok, 'Manfaat' if 'Manfaat' in rules_cocok.columns else 'None')
+    tidak_map = _build_rule_dict(rules_tidak, 'Efek_Samping' if 'Efek_Samping' in rules_tidak.columns else 'None')
+    
+    cache_cocok = {}
+    cache_tidak = {}
+    cocok_keys = list(cocok_map.keys())
+    tidak_keys = list(tidak_map.keys())
+
     hasil = []
     for _, row in produk_filter.iterrows():
-        h = _analisis_produk(row, rules_cocok, rules_tidak)
+        h = _analisis_produk(row, cocok_map, tidak_map, cache_cocok, cache_tidak, cocok_keys, tidak_keys)
         if h:
             hasil.append(h)
 
@@ -343,7 +358,10 @@ def analyze_ingredients():
             'Ingridients': ','.join(ingredients),
         })
 
-    hasil = _analisis_produk(dummy_produk, rules_cocok, rules_tidak)
+    cocok_map = _build_rule_dict(rules_cocok, 'Manfaat' if 'Manfaat' in rules_cocok.columns else 'None')
+    tidak_map = _build_rule_dict(rules_tidak, 'Efek_Samping' if 'Efek_Samping' in rules_tidak.columns else 'None')
+    
+    hasil = _analisis_produk(dummy_produk, cocok_map, tidak_map, {}, {}, list(cocok_map.keys()), list(tidak_map.keys()))
     
     return jsonify({
         'jenis_kulit':   jenis_kulit,
