@@ -31,7 +31,7 @@ def load_ingredients():
     try:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_dir = os.path.dirname(current_dir)
-        csv_file = os.path.join(project_dir, 'Dataset TA - Ingredients.csv')
+        csv_file = os.path.join(current_dir, 'Dataset', 'Ingredients.csv')
 
         df = pd.read_csv(csv_file).fillna('')
         ingredients = df.to_dict(orient='records')

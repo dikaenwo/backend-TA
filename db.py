@@ -3,13 +3,13 @@ from mysql.connector import Error
 import os
 
 # ─── Database Configuration ───────────────────────────────────────────────────
-_DB_NAME = os.getenv('DB_NAME', 'bglow_db')
+_DB_NAME = os.getenv('DB_NAME', 'bglow_TA')
 
 _BASE_CONFIG = {
     'host':       os.getenv('DB_HOST', '127.0.0.1'),
     'port':       int(os.getenv('DB_PORT', 3306)),
-    'user':       os.getenv('DB_USER', 'root'),
-    'password':   os.getenv('DB_PASSWORD', ''),
+    'user':       os.getenv('DB_USER', 'bglow'),
+    'password':   os.getenv('DB_PASSWORD', 'Bglow@2026'),
     'charset':    'utf8mb4',
     'autocommit': False,
 }
