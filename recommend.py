@@ -230,8 +230,8 @@ def get_recommendations():
     masalah_kulit = (data.get('masalah_kulit') or '').strip()
     kategori      = (data.get('kategori')      or '').strip()
 
-    if not jenis_kulit or not masalah_kulit:
-        return jsonify({'error': 'jenis_kulit dan masalah_kulit wajib diisi.'}), 400
+    if not jenis_kulit:
+        return jsonify({'error': 'jenis_kulit wajib diisi.'}), 400
 
     jc = data_set['jenis_cocok']
     jt = data_set['jenis_tidak']
@@ -306,8 +306,8 @@ def analyze_ingredients():
     masalah_kulit = (data.get('masalah_kulit') or '').strip()
     ingredients   = data.get('ingredients') or []
 
-    if not jenis_kulit or not masalah_kulit or not ingredients:
-        return jsonify({'error': 'jenis_kulit, masalah_kulit, dan ingredients wajib diisi.'}), 400
+    if not jenis_kulit or not ingredients:
+        return jsonify({'error': 'jenis_kulit dan ingredients wajib diisi.'}), 400
 
     jc = data_set['jenis_cocok']
     jt = data_set['jenis_tidak']
