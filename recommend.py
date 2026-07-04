@@ -441,6 +441,50 @@ def analyze_ingredients():
     }), 200
 
 
+# ─── POST /api/recommend/batch ─────────────────────────────────────────────
+
+@recommend_bp.route('/batch', methods=['POST'])
+def batch_scores():
+    """
+    Hitung skor untuk semua produk sekaligus (digunakan untuk ProductList).
+    Hanya mengembalikan nama_produk dan skor untuk menghemat bandwidth.
+    Body JSON:
+    {
+        "jenis_kulit":   "Normal",
+        "masalah_kulit": "Berjerawat"
+    }
+    """
+    try:
+        data_set = _get_data()
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 503
+
+    data          = request.get_json(silent=True) or {}
+    jenis_kulit   = (data.get('jenis_kulit')   or '').strip()
+    masalah_kulit = (data.get('masalah_kulit') or '').strip()
+
+    if not jenis_kulit:
+        return jsonify({})
+
+    cocok_map, tidak_map = _build_rule_maps_from_csv(
+        data_set['rules_df'], jenis_kulit, masalah_kulit
+    )
+
+    produk_df = data_set['produk_df']
+    cache_cocok = {}
+    cache_tidak = {}
+    cocok_keys  = list(cocok_map.keys())
+    tidak_keys  = list(tidak_map.keys())
+
+    scores_map = {}
+    for _, row in produk_df.iterrows():
+        h = _analisis_produk(row, cocok_map, tidak_map, cache_cocok, cache_tidak, cocok_keys, tidak_keys)
+        if h:
+            scores_map[h['nama_produk']] = h['skor']
+
+    return jsonify(scores_map), 200
+
+
 # ─── GET /api/recommend/search ────────────────────────────────────────────────
 
 @recommend_bp.route('/search', methods=['GET'])
