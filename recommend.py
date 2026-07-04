@@ -49,7 +49,7 @@ def _get_data():
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _bobot_posisi(index: int, total: int) -> float:
+def _bobot_posisi(index: int, total: int) -> tuple[float, float]:
     """
     Bobot berdasarkan posisi ingredient dalam formula produk:
       Top 20%    (Utama)   → +1.0 / -2.0
@@ -58,10 +58,10 @@ def _bobot_posisi(index: int, total: int) -> float:
     """
     persen = (index + 1) / total
     if persen <= 0.2:
-        return 1.0
+        return 1.0, 2.0
     elif persen <= 0.5:
-        return 0.5
-    return 0.2
+        return 0.5, 1.0
+    return 0.2, 0.5
 
 
 def _parse_ingredients(raw: str) -> list:
@@ -204,7 +204,7 @@ def _analisis_produk(
     score = 0.0
 
     for idx, ingr in enumerate(ingredients_list):
-        w = _bobot_posisi(idx, total)
+        pos_w, neg_w = _bobot_posisi(idx, total)
         k_aliases = _get_aliases(ingr)
 
         # ── Cek Cocok (Exact → Fuzzy) ──────────────────────────────────────
@@ -229,8 +229,8 @@ def _analisis_produk(
 
         if match_cocok:
             orig_name, manfaat = cocok_map[match_cocok]
-            cocok_found.append({'ingredient': orig_name, 'bobot': round(w, 2), 'manfaat': str(manfaat)})
-            score += w
+            cocok_found.append({'ingredient': orig_name, 'bobot': round(pos_w, 2), 'manfaat': str(manfaat)})
+            score += pos_w
             ingredients_detail.append({'nama': ingr, 'status': 'cocok'})
             continue
 
@@ -256,8 +256,8 @@ def _analisis_produk(
 
         if match_tidak:
             orig_name, efek = tidak_map[match_tidak]
-            tidak_found.append({'ingredient': orig_name, 'bobot': round(2 * w, 2), 'efek_samping': str(efek)})
-            score -= 2 * w
+            tidak_found.append({'ingredient': orig_name, 'bobot': round(neg_w, 2), 'efek_samping': str(efek)})
+            score -= neg_w
             ingredients_detail.append({'nama': ingr, 'status': 'tidak_cocok'})
             continue
 
