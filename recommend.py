@@ -324,6 +324,8 @@ def get_recommendations():
     jenis_kulit   = (data.get('jenis_kulit')   or '').strip()
     masalah_kulit = (data.get('masalah_kulit') or '').strip()
     kategori      = (data.get('kategori')      or '').strip()
+    if masalah_kulit.lower() == 'null':
+        masalah_kulit = ''
 
     if not jenis_kulit:
         return jsonify({'error': 'jenis_kulit wajib diisi.'}), 400
@@ -388,6 +390,8 @@ def analyze_ingredients():
     jenis_kulit   = (data.get('jenis_kulit')   or '').strip()
     masalah_kulit = (data.get('masalah_kulit') or '').strip()
     ingredients   = data.get('ingredients') or []
+    if masalah_kulit.lower() == 'null':
+        masalah_kulit = ''
 
     if not jenis_kulit or not ingredients:
         return jsonify({'error': 'jenis_kulit dan ingredients wajib diisi.'}), 400
@@ -462,9 +466,12 @@ def batch_scores():
     data          = request.get_json(silent=True) or {}
     jenis_kulit   = (data.get('jenis_kulit')   or '').strip()
     masalah_kulit = (data.get('masalah_kulit') or '').strip()
+    # 'Null' means user picked "no concern", treat as empty
+    if masalah_kulit.lower() == 'null':
+        masalah_kulit = ''
 
     if not jenis_kulit:
-        return jsonify({})
+        return jsonify([])
 
     cocok_map, tidak_map = _build_rule_maps_from_csv(
         data_set['rules_df'], jenis_kulit, masalah_kulit
@@ -476,13 +483,19 @@ def batch_scores():
     cocok_keys  = list(cocok_map.keys())
     tidak_keys  = list(tidak_map.keys())
 
-    scores_map = {}
+    # Build results: match by normalized ingredients string so frontend can lookup by ingredients
+    results = []
     for _, row in produk_df.iterrows():
         h = _analisis_produk(row, cocok_map, tidak_map, cache_cocok, cache_tidak, cocok_keys, tidak_keys)
         if h:
-            scores_map[h['nama_produk']] = h['skor']
+            ingr_key = ','.join(sorted([i.strip().lower() for i in _parse_ingredients(row.get('Ingridients', ''))]))
+            results.append({
+                'nama': h['nama_produk'],
+                'skor': h['skor'],
+                'ingr_key': ingr_key,
+            })
 
-    return jsonify(scores_map), 200
+    return jsonify(results), 200
 
 
 # ─── GET /api/recommend/search ────────────────────────────────────────────────
