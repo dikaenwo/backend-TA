@@ -558,6 +558,12 @@ def _analisis_produk_v3(
     link    = produk.get('Link_Produk')
     tekstur = produk.get('Tekstur')
 
+    # ── Override final recommendation if it fails the hard filter ──
+    if not skin_type_info['compatible']:
+        rekomendasi_text = 'Tidak Direkomendasikan (Tidak Cocok Jenis Kulit)'
+    else:
+        rekomendasi_text = 'Direkomendasikan' if final_score > 0 else 'Tidak Direkomendasikan'
+
     return {
         'nama_produk':        str(produk.get('Nama Produk', '')),
         'kategori':           str(produk.get('Kategori', '')),
@@ -576,7 +582,7 @@ def _analisis_produk_v3(
         # Skin type info (constraint, bukan ranking)
         'skin_type_compatible': skin_type_info['compatible'],
         'skin_type_info':       skin_type_info,
-        'rekomendasi':        'Direkomendasikan' if final_score > 0 else 'Tidak Direkomendasikan',
+        'rekomendasi':        rekomendasi_text,
     }
 
 
