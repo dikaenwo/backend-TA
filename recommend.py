@@ -2,14 +2,17 @@
 recommend.py – Product Recommendation Engine for B-Glow
 Prefix: /api/recommend
 
-Algoritma:
+Algoritma v2:
   - Load rules dari Dataset Terbaru.csv (1 file, semua kolom jenis & masalah kulit)
   - Hitung bobot posisi ingredient: atas 20% → 1.0, 20-50% → 0.5, sisanya → 0.2
-  - Bahan cocok  → +score (bobot posisi)
-  - Bahan tidak cocok → -2x score (bobot posisi)
+  - Skor dihitung per axis (jenis kulit & masalah kulit) secara independen
+  - Masing-masing dinormalisasi ke [-100, 100] agar panjang ingredient list tidak bias
+  - Digabung dengan bobot W_JENIS=0.35, W_MASALAH=0.65
   - Handle alias: nama/alternatif (/) dan nama (dalam kurung)
   - Urutkan dari skor tertinggi
 """
+
+from __future__ import annotations
 
 from flask import Blueprint, request, jsonify
 import pandas as pd
@@ -29,6 +32,12 @@ _cache = {}
 # Jenis Kulit & Masalah Kulit yang valid (sesuai dataset terbaru)
 VALID_JENIS_KULIT   = {'Normal', 'Berminyak', 'Kering', 'Kombinasi'}
 VALID_MASALAH_KULIT = {'Berjerawat', 'PIE', 'PIH', 'Aging', 'Kusam', 'Kemerahan'}
+
+# ─── Scoring Weights ──────────────────────────────────────────────────────────
+# Masalah kulit gets higher weight because it determines treatment effectiveness.
+# Adjust these to tune the balance between jenis kulit and masalah kulit.
+W_JENIS   = 0.35
+W_MASALAH = 0.65
 
 
 def _get_data():
@@ -111,19 +120,23 @@ def _get_aliases(ingr_name: str) -> set:
     return {a for a in aliases if len(a) > 1}
 
 
-def _build_rule_maps_from_csv(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit: str):
-    """
-    Buat dua dict dari Dataset Terbaru.csv:
-      cocok_map : alias → (original_name, alasan)
-      tidak_map : alias → (original_name, alasan)
+# ─── Core Scoring Functions (v2) ─────────────────────────────────────────────
 
-    Cara kerja:
-      Untuk tiap baris, cek apakah jenis_kulit ada di kolom 'Jenis Kulit Cocok'
-      dan/atau masalah_kulit ada di kolom 'Masalah Kulit Cocok'.
-      Demikian pula untuk kolom Tidak Cocok.
+def _build_rule_maps_v2(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit: str):
     """
-    cocok_map = {}
-    tidak_map = {}
+    Build 4 independent maps from Dataset Terbaru.csv:
+      jk_cocok_map : alias → (original_name, alasan)  — cocok for jenis_kulit
+      jk_tidak_map : alias → (original_name, alasan)  — tidak cocok for jenis_kulit
+      mk_cocok_map : alias → (original_name, alasan)  — cocok for masalah_kulit
+      mk_tidak_map : alias → (original_name, alasan)  — tidak cocok for masalah_kulit
+
+    Each axis is completely independent — eliminates the OR bug where
+    jenis_kulit match would short-circuit masalah_kulit evaluation.
+    """
+    jk_cocok_map = {}
+    jk_tidak_map = {}
+    mk_cocok_map = {}
+    mk_tidak_map = {}
 
     for _, row in rules_df.iterrows():
         orig_name = str(row.get('Ingredient', '')).strip()
@@ -139,61 +152,124 @@ def _build_rule_maps_from_csv(rules_df: pd.DataFrame, jenis_kulit: str, masalah_
         mk_tidak   = str(row.get('Masalah Kulit Tidak Cocok', '') or '').strip()
         alasan_mkt = str(row.get('Alasan Masalah Kulit Tidak Cocok', '') or '').strip()
 
-        # Parsing nilai multi (dipisah koma)
+        # Parse comma-separated values
         jk_cocok_list = [x.strip() for x in jk_cocok.split(',') if x.strip() and x.strip() != '-']
         jk_tidak_list = [x.strip() for x in jk_tidak.split(',') if x.strip() and x.strip() != '-']
         mk_cocok_list = [x.strip() for x in mk_cocok.split(',') if x.strip() and x.strip() != '-']
         mk_tidak_list = [x.strip() for x in mk_tidak.split(',') if x.strip() and x.strip() != '-']
 
-        is_cocok = (
-            (jenis_kulit and jenis_kulit in jk_cocok_list) or
-            (masalah_kulit and masalah_kulit in mk_cocok_list)
-        )
-        is_tidak = (
-            (jenis_kulit and jenis_kulit in jk_tidak_list) or
-            (masalah_kulit and masalah_kulit in mk_tidak_list)
-        )
-
-        # Gabungkan alasan yang relevan
-        alasan_cocok_parts = []
-        if jenis_kulit and jenis_kulit in jk_cocok_list and alasan_jkc and alasan_jkc != 'nan':
-            alasan_cocok_parts.append(alasan_jkc)
-        if masalah_kulit and masalah_kulit in mk_cocok_list and alasan_mkc and alasan_mkc != 'nan':
-            alasan_cocok_parts.append(alasan_mkc)
-        alasan_cocok = ' | '.join(alasan_cocok_parts) if alasan_cocok_parts else '-'
-
-        alasan_tidak_parts = []
-        if jenis_kulit and jenis_kulit in jk_tidak_list and alasan_jkt and alasan_jkt != 'nan':
-            alasan_tidak_parts.append(alasan_jkt)
-        if masalah_kulit and masalah_kulit in mk_tidak_list and alasan_mkt and alasan_mkt != 'nan':
-            alasan_tidak_parts.append(alasan_mkt)
-        alasan_tidak = ' | '.join(alasan_tidak_parts) if alasan_tidak_parts else '-'
-
         aliases = _get_aliases(orig_name)
 
-        # Prioritas: jika ingredient cocok DAN tidak cocok sekaligus,
-        # masukkan ke tidak_cocok (lebih konservatif)
-        if is_tidak:
-            for alias in aliases:
-                if alias not in tidak_map:
-                    tidak_map[alias] = (orig_name, alasan_tidak)
-        elif is_cocok:
-            for alias in aliases:
-                if alias not in cocok_map:
-                    cocok_map[alias] = (orig_name, alasan_cocok)
+        # ── Jenis Kulit axis (independent) ──
+        if jenis_kulit:
+            is_jk_tidak = jenis_kulit in jk_tidak_list
+            is_jk_cocok = jenis_kulit in jk_cocok_list
+            alasan_jkc_clean = alasan_jkc if alasan_jkc and alasan_jkc != 'nan' else '-'
+            alasan_jkt_clean = alasan_jkt if alasan_jkt and alasan_jkt != 'nan' else '-'
 
-    return cocok_map, tidak_map
+            # Conservative: tidak cocok takes priority over cocok
+            if is_jk_tidak:
+                for alias in aliases:
+                    if alias not in jk_tidak_map:
+                        jk_tidak_map[alias] = (orig_name, alasan_jkt_clean)
+            elif is_jk_cocok:
+                for alias in aliases:
+                    if alias not in jk_cocok_map:
+                        jk_cocok_map[alias] = (orig_name, alasan_jkc_clean)
+
+        # ── Masalah Kulit axis (independent) ──
+        if masalah_kulit:
+            is_mk_tidak = masalah_kulit in mk_tidak_list
+            is_mk_cocok = masalah_kulit in mk_cocok_list
+            alasan_mkc_clean = alasan_mkc if alasan_mkc and alasan_mkc != 'nan' else '-'
+            alasan_mkt_clean = alasan_mkt if alasan_mkt and alasan_mkt != 'nan' else '-'
+
+            if is_mk_tidak:
+                for alias in aliases:
+                    if alias not in mk_tidak_map:
+                        mk_tidak_map[alias] = (orig_name, alasan_mkt_clean)
+            elif is_mk_cocok:
+                for alias in aliases:
+                    if alias not in mk_cocok_map:
+                        mk_cocok_map[alias] = (orig_name, alasan_mkc_clean)
+
+    return jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map
 
 
-def _analisis_produk(
+def _match_ingredient(k_aliases, cocok_map, tidak_map,
+                      cache_cocok, cache_tidak, cocok_keys, tidak_keys):
+    """
+    Try to match ingredient aliases against cocok/tidak maps (exact → fuzzy).
+    Returns ('cocok', matched_key) or ('tidak', matched_key) or (None, None).
+    """
+    # ── Check Cocok (Exact → Fuzzy) ──
+    match_cocok = None
+    for a in k_aliases:
+        if a in cocok_map:
+            match_cocok = a
+            break
+
+    if not match_cocok:
+        for a in k_aliases:
+            if a in cache_cocok:
+                match_cocok = cache_cocok[a]
+                if match_cocok:
+                    break
+            else:
+                fuzz = get_close_matches(a, cocok_keys, n=1, cutoff=0.85)
+                cache_cocok[a] = fuzz[0] if fuzz else None
+                if fuzz:
+                    match_cocok = fuzz[0]
+                    break
+
+    if match_cocok:
+        return 'cocok', match_cocok
+
+    # ── Check Tidak Cocok (Exact → Fuzzy) ──
+    match_tidak = None
+    for a in k_aliases:
+        if a in tidak_map:
+            match_tidak = a
+            break
+
+    if not match_tidak:
+        for a in k_aliases:
+            if a in cache_tidak:
+                match_tidak = cache_tidak[a]
+                if match_tidak:
+                    break
+            else:
+                fuzz = get_close_matches(a, tidak_keys, n=1, cutoff=0.85)
+                cache_tidak[a] = fuzz[0] if fuzz else None
+                if fuzz:
+                    match_tidak = fuzz[0]
+                    break
+
+    if match_tidak:
+        return 'tidak', match_tidak
+
+    return None, None
+
+
+def _analisis_produk_v2(
     produk: pd.Series,
-    cocok_map: dict,
-    tidak_map: dict,
-    cache_cocok: dict,
-    cache_tidak: dict,
-    cocok_keys: list,
-    tidak_keys: list,
+    jk_cocok_map: dict, jk_tidak_map: dict,
+    mk_cocok_map: dict, mk_tidak_map: dict,
+    cache_jk_cocok: dict, cache_jk_tidak: dict,
+    cache_mk_cocok: dict, cache_mk_tidak: dict,
+    jk_cocok_keys: list, jk_tidak_keys: list,
+    mk_cocok_keys: list, mk_tidak_keys: list,
+    has_masalah: bool,
 ) -> dict:
+    """
+    Analisis satu produk dengan dual-axis scoring + normalisasi.
+
+    Skor dihitung per axis (jenis kulit & masalah kulit) secara independen,
+    dinormalisasi ke [-100, 100], lalu digabung dengan bobot W_JENIS/W_MASALAH.
+    Ini mengatasi:
+      - Bug A: OR logic → sekarang tiap axis independen
+      - Bug B: Raw sum bias → sekarang dinormalisasi per total ingredient
+    """
     ingredients_list = _parse_ingredients(produk.get('Ingridients', ''))
     total = len(ingredients_list)
     if total == 0:
@@ -201,67 +277,82 @@ def _analisis_produk(
 
     cocok_found, tidak_found = [], []
     ingredients_detail = []
-    score = 0.0
+    score_jenis = 0.0
+    score_masalah = 0.0
+
+    # Pre-compute max possible score for normalization
+    # (= sum of all pos_w if every ingredient were "cocok")
+    max_possible = sum(_bobot_posisi(i, total)[0] for i in range(total))
 
     for idx, ingr in enumerate(ingredients_list):
         pos_w, neg_w = _bobot_posisi(idx, total)
         k_aliases = _get_aliases(ingr)
 
-        # ── Cek Cocok (Exact → Fuzzy) ──────────────────────────────────────
-        match_cocok = None
-        for a in k_aliases:
-            if a in cocok_map:
-                match_cocok = a
-                break
+        # ── Jenis Kulit axis ──
+        jk_type, jk_key = _match_ingredient(
+            k_aliases, jk_cocok_map, jk_tidak_map,
+            cache_jk_cocok, cache_jk_tidak, jk_cocok_keys, jk_tidak_keys
+        )
+        if jk_type == 'cocok':
+            orig, manfaat = jk_cocok_map[jk_key]
+            score_jenis += pos_w
+            cocok_found.append({
+                'ingredient': orig, 'bobot': round(pos_w, 2),
+                'manfaat': str(manfaat), 'axis': 'jenis_kulit',
+            })
+        elif jk_type == 'tidak':
+            orig, efek = jk_tidak_map[jk_key]
+            score_jenis -= neg_w
+            tidak_found.append({
+                'ingredient': orig, 'bobot': round(neg_w, 2),
+                'efek_samping': str(efek), 'axis': 'jenis_kulit',
+            })
 
-        if not match_cocok:
-            for a in k_aliases:
-                if a in cache_cocok:
-                    match_cocok = cache_cocok[a]
-                    if match_cocok:
-                        break
-                else:
-                    fuzz = get_close_matches(a, cocok_keys, n=1, cutoff=0.85)
-                    cache_cocok[a] = fuzz[0] if fuzz else None
-                    if fuzz:
-                        match_cocok = fuzz[0]
-                        break
+        # ── Masalah Kulit axis ──
+        mk_type = None
+        if has_masalah:
+            mk_type, mk_key = _match_ingredient(
+                k_aliases, mk_cocok_map, mk_tidak_map,
+                cache_mk_cocok, cache_mk_tidak, mk_cocok_keys, mk_tidak_keys
+            )
+            if mk_type == 'cocok':
+                orig, manfaat = mk_cocok_map[mk_key]
+                score_masalah += pos_w
+                cocok_found.append({
+                    'ingredient': orig, 'bobot': round(pos_w, 2),
+                    'manfaat': str(manfaat), 'axis': 'masalah_kulit',
+                })
+            elif mk_type == 'tidak':
+                orig, efek = mk_tidak_map[mk_key]
+                score_masalah -= neg_w
+                tidak_found.append({
+                    'ingredient': orig, 'bobot': round(neg_w, 2),
+                    'efek_samping': str(efek), 'axis': 'masalah_kulit',
+                })
 
-        if match_cocok:
-            orig_name, manfaat = cocok_map[match_cocok]
-            cocok_found.append({'ingredient': orig_name, 'bobot': round(pos_w, 2), 'manfaat': str(manfaat)})
-            score += pos_w
-            ingredients_detail.append({'nama': ingr, 'status': 'cocok'})
-            continue
-
-        # ── Cek Tidak Cocok (Exact → Fuzzy) ────────────────────────────────
-        match_tidak = None
-        for a in k_aliases:
-            if a in tidak_map:
-                match_tidak = a
-                break
-
-        if not match_tidak:
-            for a in k_aliases:
-                if a in cache_tidak:
-                    match_tidak = cache_tidak[a]
-                    if match_tidak:
-                        break
-                else:
-                    fuzz = get_close_matches(a, tidak_keys, n=1, cutoff=0.85)
-                    cache_tidak[a] = fuzz[0] if fuzz else None
-                    if fuzz:
-                        match_tidak = fuzz[0]
-                        break
-
-        if match_tidak:
-            orig_name, efek = tidak_map[match_tidak]
-            tidak_found.append({'ingredient': orig_name, 'bobot': round(neg_w, 2), 'efek_samping': str(efek)})
-            score -= neg_w
+        # ── Determine ingredient status (conservative: tidak > cocok > netral) ──
+        if jk_type == 'tidak' or mk_type == 'tidak':
             ingredients_detail.append({'nama': ingr, 'status': 'tidak_cocok'})
-            continue
+        elif jk_type == 'cocok' or mk_type == 'cocok':
+            ingredients_detail.append({'nama': ingr, 'status': 'cocok'})
+        else:
+            ingredients_detail.append({'nama': ingr, 'status': 'netral'})
 
-        ingredients_detail.append({'nama': ingr, 'status': 'netral'})
+    # ── Normalize each axis to [-100, 100] ──
+    if max_possible > 0:
+        norm_jenis   = max(-100.0, min(100.0, (score_jenis   / max_possible) * 100))
+        norm_masalah = max(-100.0, min(100.0, (score_masalah / max_possible) * 100))
+    else:
+        norm_jenis   = 0.0
+        norm_masalah = 0.0
+
+    # ── Combine with weights ──
+    if has_masalah:
+        w_j, w_m = W_JENIS, W_MASALAH
+    else:
+        w_j, w_m = 1.0, 0.0
+
+    final_score = norm_jenis * w_j + norm_masalah * w_m
 
     harga   = produk.get('Harga')
     gambar  = produk.get('Gambar')
@@ -278,9 +369,23 @@ def _analisis_produk(
         'bahan_cocok':        cocok_found,
         'bahan_tidak_cocok':  tidak_found,
         'ingredients_detail': ingredients_detail,
-        'skor':               round(score, 2),
-        'rekomendasi':        'Direkomendasikan' if score > 0 else 'Tidak Direkomendasikan',
+        'skor':               round(final_score, 2),
+        'skor_jenis':         round(norm_jenis, 2),
+        'skor_masalah':       round(norm_masalah, 2),
+        'rekomendasi':        'Direkomendasikan' if final_score > 0 else 'Tidak Direkomendasikan',
     }
+
+
+# ─── Helper: prepare caches & keys for v2 analysis ───────────────────────────
+
+def _prepare_v2_caches(jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map):
+    """Create fresh fuzzy-match caches and key lists for _analisis_produk_v2."""
+    return (
+        {}, {},  # cache_jk_cocok, cache_jk_tidak
+        {}, {},  # cache_mk_cocok, cache_mk_tidak
+        list(jk_cocok_map.keys()), list(jk_tidak_map.keys()),
+        list(mk_cocok_map.keys()), list(mk_tidak_map.keys()),
+    )
 
 
 # ─── GET /api/recommend/debug ─────────────────────────────────────────────────
@@ -330,9 +435,10 @@ def get_recommendations():
     if not jenis_kulit:
         return jsonify({'error': 'jenis_kulit wajib diisi.'}), 400
 
-    cocok_map, tidak_map = _build_rule_maps_from_csv(
+    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _build_rule_maps_v2(
         data_set['rules_df'], jenis_kulit, masalah_kulit
     )
+    has_masalah = bool(masalah_kulit)
 
     produk_df = data_set['produk_df']
     produk_filter = (
@@ -343,14 +449,21 @@ def get_recommendations():
     if produk_filter.empty:
         return jsonify({'results': [], 'total': 0, 'kategori': kategori}), 200
 
-    cache_cocok = {}
-    cache_tidak = {}
-    cocok_keys  = list(cocok_map.keys())
-    tidak_keys  = list(tidak_map.keys())
+    (cache_jk_cocok, cache_jk_tidak,
+     cache_mk_cocok, cache_mk_tidak,
+     jk_cocok_keys, jk_tidak_keys,
+     mk_cocok_keys, mk_tidak_keys) = _prepare_v2_caches(
+        jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map
+    )
 
     hasil = []
     for _, row in produk_filter.iterrows():
-        h = _analisis_produk(row, cocok_map, tidak_map, cache_cocok, cache_tidak, cocok_keys, tidak_keys)
+        h = _analisis_produk_v2(
+            row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
+            cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
+            jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
+            has_masalah,
+        )
         if h:
             hasil.append(h)
 
@@ -427,13 +540,17 @@ def analyze_ingredients():
             'Ingridients': ','.join(ingredients),
         })
 
-    cocok_map, tidak_map = _build_rule_maps_from_csv(
+    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _build_rule_maps_v2(
         data_set['rules_df'], jenis_kulit, masalah_kulit
     )
+    has_masalah = bool(masalah_kulit)
 
-    hasil = _analisis_produk(
-        dummy_produk, cocok_map, tidak_map, {}, {},
-        list(cocok_map.keys()), list(tidak_map.keys())
+    hasil = _analisis_produk_v2(
+        dummy_produk, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
+        {}, {}, {}, {},
+        list(jk_cocok_map.keys()), list(jk_tidak_map.keys()),
+        list(mk_cocok_map.keys()), list(mk_tidak_map.keys()),
+        has_masalah,
     )
 
     return jsonify({
@@ -473,20 +590,29 @@ def batch_scores():
     if not jenis_kulit:
         return jsonify([])
 
-    cocok_map, tidak_map = _build_rule_maps_from_csv(
+    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _build_rule_maps_v2(
         data_set['rules_df'], jenis_kulit, masalah_kulit
     )
+    has_masalah = bool(masalah_kulit)
 
     produk_df = data_set['produk_df']
-    cache_cocok = {}
-    cache_tidak = {}
-    cocok_keys  = list(cocok_map.keys())
-    tidak_keys  = list(tidak_map.keys())
+
+    (cache_jk_cocok, cache_jk_tidak,
+     cache_mk_cocok, cache_mk_tidak,
+     jk_cocok_keys, jk_tidak_keys,
+     mk_cocok_keys, mk_tidak_keys) = _prepare_v2_caches(
+        jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map
+    )
 
     # Build results: match by normalized ingredients string so frontend can lookup by ingredients
     results = []
     for _, row in produk_df.iterrows():
-        h = _analisis_produk(row, cocok_map, tidak_map, cache_cocok, cache_tidak, cocok_keys, tidak_keys)
+        h = _analisis_produk_v2(
+            row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
+            cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
+            jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
+            has_masalah,
+        )
         if h:
             ingr_key = ','.join(sorted([i.strip().lower() for i in _parse_ingredients(row.get('Ingridients', ''))]))
             results.append({
