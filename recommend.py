@@ -2,14 +2,17 @@
 recommend.py – Product Recommendation Engine for B-Glow
 Prefix: /api/recommend
 
-Algoritma v2:
-  - Load rules dari Dataset Terbaru.csv (1 file, semua kolom jenis & masalah kulit)
-  - Hitung bobot posisi ingredient: atas 20% → 1.0, 20-50% → 0.5, sisanya → 0.2
-  - Skor dihitung per axis (jenis kulit & masalah kulit) secara independen
-  - Masing-masing dinormalisasi ke [-100, 100] agar panjang ingredient list tidak bias
-  - Digabung dengan bobot W_JENIS=0.35, W_MASALAH=0.65
+Algoritma v3 (Constraint-Based Filtering + WSM):
+  - Arsitektur berdasarkan Burke (2002): constraint vs preference/utility
+  - Jenis Kulit  → Rule-Based Filtering (eligibility constraint)
+    • Hard reject jika ingredient top-20% tidak cocok jenis kulit user
+    • Ingredient di posisi >20% yang tidak cocok → warning saja
+  - Masalah Kulit → WSM single-axis (ranking criterion)
+    • Bobot posisi ingredient: atas 20% → 1.0, 20-50% → 0.5, sisanya → 0.2
+    • Bobot spesifisitas ingredient: terapeutik (1.5x), moderat (1.0x), generik (0.7x)
+    • Normalisasi ke [-100, 100] agar panjang ingredient list tidak bias
   - Handle alias: nama/alternatif (/) dan nama (dalam kurung)
-  - Urutkan dari skor tertinggi
+  - Produk lolos filter diurutkan dari skor tertinggi
 """
 
 from __future__ import annotations
@@ -33,11 +36,14 @@ _cache = {}
 VALID_JENIS_KULIT   = {'Normal', 'Berminyak', 'Kering', 'Kombinasi'}
 VALID_MASALAH_KULIT = {'Berjerawat', 'PIE', 'PIH', 'Aging', 'Kusam', 'Kemerahan'}
 
-# ─── Scoring Weights ──────────────────────────────────────────────────────────
-# Masalah kulit gets higher weight because it determines treatment effectiveness.
-# Adjust these to tune the balance between jenis kulit and masalah kulit.
-W_JENIS   = 0.35
-W_MASALAH = 0.65
+# ─── Ingredient Specificity Multipliers ──────────────────────────────────────
+# Dihitung otomatis dari KB: berapa banyak masalah kulit yang di-tag "cocok"
+# Therapeutic (≤2 masalah) → ingredient spesifik, bobot lebih tinggi
+# Moderate (3-4 masalah)   → bobot standar
+# Generic (≥5 masalah)     → ingredient generik/suportif, bobot lebih rendah
+SPEC_THERAPEUTIC = 1.5   # e.g., Salicylic Acid (hanya Berjerawat, PIH)
+SPEC_MODERATE    = 1.0   # e.g., Centella Asiatica (beberapa masalah)
+SPEC_GENERIC     = 0.7   # e.g., Niacinamide (semua masalah)
 
 
 def _get_data():
@@ -48,12 +54,57 @@ def _get_data():
         rules_df = pd.read_csv(os.path.join(_DATASET, 'Dataset Terbaru.csv'))
         _cache['rules_df']  = rules_df
         _cache['produk_df'] = pd.read_excel(os.path.join(_DATASET, 'Dataset Produk.xlsx'))
+
+        # Build specificity map once on first load
+        _cache['specificity_map'] = _build_specificity_map(rules_df)
+
         print("[Recommend] Dataset Terbaru.csv & Dataset Produk.xlsx berhasil dimuat.")
         print(f"  Rules: {len(rules_df)} baris | Produk: {len(_cache['produk_df'])} baris")
+        print(f"  Specificity map: {len(_cache['specificity_map'])} ingredients")
     except Exception as e:
         _cache.clear()
         raise RuntimeError(f"Gagal memuat dataset: {e}") from e
     return _cache
+
+
+# ─── Specificity Map Builder ─────────────────────────────────────────────────
+
+def _build_specificity_map(rules_df: pd.DataFrame) -> dict:
+    """
+    Hitung spesifisitas tiap ingredient terhadap masalah kulit.
+
+    Spesifisitas ditentukan dari berapa banyak masalah kulit yang ingredient
+    itu ditandai "cocok" di KB. Semakin sedikit masalah yang cocok, semakin
+    spesifik/terapeutik ingredient tersebut.
+
+    Returns: dict[ingredient_name_lower → multiplier (float)]
+    """
+    specificity = {}
+
+    for _, row in rules_df.iterrows():
+        name = str(row.get('Ingredient', '')).strip()
+        if not name or name == 'nan':
+            continue
+
+        mk_cocok = str(row.get('Masalah Kulit Cocok', '') or '').strip()
+        mk_list = [x.strip() for x in mk_cocok.split(',')
+                    if x.strip() and x.strip() != '-']
+        valid_count = len([m for m in mk_list if m in VALID_MASALAH_KULIT])
+
+        # Assign multiplier based on specificity tier
+        if valid_count >= 5:
+            mult = SPEC_GENERIC
+        elif valid_count >= 3:
+            mult = SPEC_MODERATE
+        else:
+            # 0-2 masalah cocok → therapeutic (or no masalah data)
+            # Ingredients with 0 masalah cocok still get therapeutic multiplier
+            # because they have no generic-boosting effect
+            mult = SPEC_THERAPEUTIC
+
+        specificity[name.lower()] = mult
+
+    return specificity
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -120,7 +171,7 @@ def _get_aliases(ingr_name: str) -> set:
     return {a for a in aliases if len(a) > 1}
 
 
-# ─── Core Scoring Functions (v2) ─────────────────────────────────────────────
+# ─── Core Scoring Functions (v3) ─────────────────────────────────────────────
 
 def _build_rule_maps_v2(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit: str):
     """
@@ -251,7 +302,95 @@ def _match_ingredient(k_aliases, cocok_map, tidak_map,
     return None, None
 
 
-def _analisis_produk_v2(
+# ─── Skin Type Filter (Constraint Layer) ─────────────────────────────────────
+
+def _filter_skin_type(
+    ingredients_list: list,
+    jk_cocok_map: dict, jk_tidak_map: dict,
+    cache_jk_cocok: dict, cache_jk_tidak: dict,
+    jk_cocok_keys: list, jk_tidak_keys: list,
+) -> dict:
+    """
+    Rule-Based Filtering Layer 1: Jenis Kulit sebagai eligibility constraint.
+
+    Aturan:
+      - Jika ada ingredient di TOP 20% posisi yang "tidak cocok" untuk jenis
+        kulit user → produk DITOLAK (hard reject).
+      - Ingredient di posisi >20% yang tidak cocok → warning saja (soft info).
+
+    Returns dict:
+      {
+        'compatible': bool,           # True = lolos filter
+        'jk_cocok_list': [...],       # ingredient cocok jenis kulit
+        'jk_warnings': [...],         # ingredient tidak cocok (posisi >20%)
+        'jk_hard_reject': [...],      # ingredient tidak cocok (posisi ≤20%)
+        'jk_cocok_count': int,
+        'jk_tidak_count': int,
+      }
+    """
+    total = len(ingredients_list)
+    if total == 0:
+        return {
+            'compatible': True,
+            'jk_cocok_list': [], 'jk_warnings': [], 'jk_hard_reject': [],
+            'jk_cocok_count': 0, 'jk_tidak_count': 0,
+        }
+
+    seen_cocok = set()
+    seen_tidak = set()
+    jk_cocok_list = []
+    jk_warnings = []
+    jk_hard_reject = []
+
+    for idx, ingr in enumerate(ingredients_list):
+        pos_w, neg_w = _bobot_posisi(idx, total)
+        k_aliases = _get_aliases(ingr)
+        persen = (idx + 1) / total
+        is_top20 = persen <= 0.2
+
+        jk_type, jk_key = _match_ingredient(
+            k_aliases, jk_cocok_map, jk_tidak_map,
+            cache_jk_cocok, cache_jk_tidak, jk_cocok_keys, jk_tidak_keys
+        )
+
+        if jk_type == 'cocok':
+            orig, alasan = jk_cocok_map[jk_key]
+            if orig not in seen_cocok:
+                seen_cocok.add(orig)
+                jk_cocok_list.append({
+                    'ingredient': orig,
+                    'alasan': str(alasan) if alasan and str(alasan) != '-' else '-',
+                    'posisi': 'Utama' if is_top20 else ('Menengah' if persen <= 0.5 else 'Minor'),
+                })
+        elif jk_type == 'tidak':
+            orig, alasan = jk_tidak_map[jk_key]
+            if orig not in seen_tidak:
+                seen_tidak.add(orig)
+                entry = {
+                    'ingredient': orig,
+                    'alasan': str(alasan) if alasan and str(alasan) != '-' else '-',
+                    'posisi': 'Utama' if is_top20 else ('Menengah' if persen <= 0.5 else 'Minor'),
+                }
+                if is_top20:
+                    jk_hard_reject.append(entry)
+                else:
+                    jk_warnings.append(entry)
+
+    compatible = len(jk_hard_reject) == 0
+
+    return {
+        'compatible': compatible,
+        'jk_cocok_list': jk_cocok_list,
+        'jk_warnings': jk_warnings,
+        'jk_hard_reject': jk_hard_reject,
+        'jk_cocok_count': len(jk_cocok_list),
+        'jk_tidak_count': len(jk_warnings) + len(jk_hard_reject),
+    }
+
+
+# ─── Product Analysis v3 (WSM Masalah Kulit Only + Specificity) ──────────────
+
+def _analisis_produk_v3(
     produk: pd.Series,
     jk_cocok_map: dict, jk_tidak_map: dict,
     mk_cocok_map: dict, mk_tidak_map: dict,
@@ -260,77 +399,53 @@ def _analisis_produk_v2(
     jk_cocok_keys: list, jk_tidak_keys: list,
     mk_cocok_keys: list, mk_tidak_keys: list,
     has_masalah: bool,
+    specificity_map: dict,
 ) -> dict:
     """
-    Analisis satu produk dengan dual-axis scoring + normalisasi.
+    Analisis satu produk dengan arsitektur v3:
+      Layer 1: Skin type constraint filter (hard/soft)
+      Layer 2: WSM scoring hanya dari masalah kulit + spesifisitas ingredient
 
-    Skor dihitung per axis (jenis kulit & masalah kulit) secara independen,
-    dinormalisasi ke [-100, 100], lalu digabung dengan bobot W_JENIS/W_MASALAH.
-    Ini mengatasi:
-      - Bug A: OR logic → sekarang tiap axis independen
-      - Bug B: Raw sum bias → sekarang dinormalisasi per total ingredient
+    Perubahan dari v2:
+      - Jenis kulit TIDAK lagi masuk WSM scoring
+      - Jenis kulit menjadi eligibility constraint (filter)
+      - Masalah kulit adalah satu-satunya ranking criterion
+      - Bobot posisi di-multiply dengan specificity multiplier
     """
     ingredients_list = _parse_ingredients(produk.get('Ingridients', ''))
     total = len(ingredients_list)
     if total == 0:
         return None
 
-    # Dedup tracking: prevent synonym ingredients (e.g. Niacinamide/Nicotinamide)
-    # from scoring multiple times on the same axis.
-    seen_jk_cocok = set()   # orig_name already scored as cocok on jenis axis
-    seen_jk_tidak = set()   # orig_name already scored as tidak on jenis axis
-    seen_mk_cocok = set()   # orig_name already scored as cocok on masalah axis
-    seen_mk_tidak = set()   # orig_name already scored as tidak on masalah axis
+    # ── Layer 1: Skin Type Filter ──
+    skin_type_info = _filter_skin_type(
+        ingredients_list,
+        jk_cocok_map, jk_tidak_map,
+        cache_jk_cocok, cache_jk_tidak,
+        jk_cocok_keys, jk_tidak_keys,
+    )
 
-    # Merged display dicts: orig_name → merged entry (both axes in one item)
-    cocok_merged = {}   # orig_name → {ingredient, bobot, manfaat_jk, manfaat_mk, bobot_max}
-    tidak_merged = {}   # orig_name → {ingredient, bobot, efek_jk, efek_mk, bobot_max}
+    # ── Layer 2: WSM Masalah Kulit Only ──
+    seen_mk_cocok = set()
+    seen_mk_tidak = set()
+
+    cocok_found = []    # bahan cocok masalah kulit
+    tidak_found = []    # bahan tidak cocok masalah kulit
 
     ingredients_detail = []
-    score_jenis = 0.0
     score_masalah = 0.0
 
     # Pre-compute max possible score for normalization
-    # (= sum of all pos_w if every ingredient were "cocok")
-    max_possible = sum(_bobot_posisi(i, total)[0] for i in range(total))
+    max_possible = sum(
+        _bobot_posisi(i, total)[0] * SPEC_THERAPEUTIC  # max possible with highest multiplier
+        for i in range(total)
+    )
 
     for idx, ingr in enumerate(ingredients_list):
         pos_w, neg_w = _bobot_posisi(idx, total)
         k_aliases = _get_aliases(ingr)
 
-        # ── Jenis Kulit axis ──
-        jk_type, jk_key = _match_ingredient(
-            k_aliases, jk_cocok_map, jk_tidak_map,
-            cache_jk_cocok, cache_jk_tidak, jk_cocok_keys, jk_tidak_keys
-        )
-        if jk_type == 'cocok':
-            orig, manfaat = jk_cocok_map[jk_key]
-            if orig not in seen_jk_cocok:
-                seen_jk_cocok.add(orig)
-                score_jenis += pos_w
-                if orig in cocok_merged:
-                    cocok_merged[orig]['manfaat_jk'] = str(manfaat)
-                    cocok_merged[orig]['bobot'] = max(cocok_merged[orig]['bobot'], round(pos_w, 2))
-                else:
-                    cocok_merged[orig] = {
-                        'ingredient': orig, 'bobot': round(pos_w, 2),
-                        'manfaat_jk': str(manfaat), 'manfaat_mk': None,
-                    }
-        elif jk_type == 'tidak':
-            orig, efek = jk_tidak_map[jk_key]
-            if orig not in seen_jk_tidak:
-                seen_jk_tidak.add(orig)
-                score_jenis -= neg_w
-                if orig in tidak_merged:
-                    tidak_merged[orig]['efek_jk'] = str(efek)
-                    tidak_merged[orig]['bobot'] = max(tidak_merged[orig]['bobot'], round(neg_w, 2))
-                else:
-                    tidak_merged[orig] = {
-                        'ingredient': orig, 'bobot': round(neg_w, 2),
-                        'efek_jk': str(efek), 'efek_mk': None,
-                    }
-
-        # ── Masalah Kulit axis ──
+        # ── Masalah Kulit axis (WSM) ──
         mk_type = None
         if has_masalah:
             mk_type, mk_key = _match_ingredient(
@@ -341,79 +456,66 @@ def _analisis_produk_v2(
                 orig, manfaat = mk_cocok_map[mk_key]
                 if orig not in seen_mk_cocok:
                     seen_mk_cocok.add(orig)
-                    score_masalah += pos_w
-                    if orig in cocok_merged:
-                        cocok_merged[orig]['manfaat_mk'] = str(manfaat)
-                        cocok_merged[orig]['bobot'] = max(cocok_merged[orig]['bobot'], round(pos_w, 2))
-                    else:
-                        cocok_merged[orig] = {
-                            'ingredient': orig, 'bobot': round(pos_w, 2),
-                            'manfaat_jk': None, 'manfaat_mk': str(manfaat),
-                        }
+                    # Apply specificity multiplier
+                    spec_mult = specificity_map.get(orig.lower(), SPEC_MODERATE)
+                    effective_w = pos_w * spec_mult
+                    score_masalah += effective_w
+                    cocok_found.append({
+                        'ingredient': orig,
+                        'bobot': round(pos_w, 2),
+                        'bobot_efektif': round(effective_w, 2),
+                        'spesifisitas': _spec_label(spec_mult),
+                        'manfaat': str(manfaat) if manfaat and str(manfaat) != '-' else '-',
+                    })
             elif mk_type == 'tidak':
                 orig, efek = mk_tidak_map[mk_key]
                 if orig not in seen_mk_tidak:
                     seen_mk_tidak.add(orig)
-                    score_masalah -= neg_w
-                    if orig in tidak_merged:
-                        tidak_merged[orig]['efek_mk'] = str(efek)
-                        tidak_merged[orig]['bobot'] = max(tidak_merged[orig]['bobot'], round(neg_w, 2))
-                    else:
-                        tidak_merged[orig] = {
-                            'ingredient': orig, 'bobot': round(neg_w, 2),
-                            'efek_jk': None, 'efek_mk': str(efek),
-                        }
+                    spec_mult = specificity_map.get(orig.lower(), SPEC_MODERATE)
+                    effective_w = neg_w * spec_mult
+                    score_masalah -= effective_w
+                    tidak_found.append({
+                        'ingredient': orig,
+                        'bobot': round(neg_w, 2),
+                        'bobot_efektif': round(effective_w, 2),
+                        'spesifisitas': _spec_label(spec_mult),
+                        'efek_samping': str(efek) if efek and str(efek) != '-' else '-',
+                    })
 
-        # ── Determine ingredient status (conservative: tidak > cocok > netral) ──
-        if jk_type == 'tidak' or mk_type == 'tidak':
-            ingredients_detail.append({'nama': ingr, 'status': 'tidak_cocok'})
-        elif jk_type == 'cocok' or mk_type == 'cocok':
-            ingredients_detail.append({'nama': ingr, 'status': 'cocok'})
-        else:
-            ingredients_detail.append({'nama': ingr, 'status': 'netral'})
+        # ── Determine ingredient status ──
+        # Check jk status from skin_type_info
+        jk_tidak_names = {e['ingredient'] for e in skin_type_info['jk_hard_reject']}
+        jk_tidak_names |= {e['ingredient'] for e in skin_type_info['jk_warnings']}
+        jk_cocok_names = {e['ingredient'] for e in skin_type_info['jk_cocok_list']}
 
-    # ── Build final cocok_found / tidak_found lists (deduplicated, merged axes) ──
-    cocok_found = []
-    for entry in cocok_merged.values():
-        manfaat_parts = []
-        if entry['manfaat_jk'] and entry['manfaat_jk'] != '-':
-            manfaat_parts.append(entry['manfaat_jk'])
-        if entry['manfaat_mk'] and entry['manfaat_mk'] != '-':
-            manfaat_parts.append(entry['manfaat_mk'])
-        cocok_found.append({
-            'ingredient': entry['ingredient'],
-            'bobot': entry['bobot'],
-            'manfaat': ' | '.join(manfaat_parts) if manfaat_parts else '-',
-        })
+        # Match this ingredient to its original name (if matched)
+        ingr_lower_aliases = _get_aliases(ingr)
+        ingr_status = 'netral'
 
-    tidak_found = []
-    for entry in tidak_merged.values():
-        efek_parts = []
-        if entry['efek_jk'] and entry['efek_jk'] != '-':
-            efek_parts.append(entry['efek_jk'])
-        if entry['efek_mk'] and entry['efek_mk'] != '-':
-            efek_parts.append(entry['efek_mk'])
-        tidak_found.append({
-            'ingredient': entry['ingredient'],
-            'bobot': entry['bobot'],
-            'efek_samping': ' | '.join(efek_parts) if efek_parts else '-',
-        })
+        # Check mk status
+        if mk_type == 'tidak':
+            ingr_status = 'tidak_cocok'
+        elif mk_type == 'cocok':
+            ingr_status = 'cocok'
 
-    # ── Normalize each axis to [-100, 100] ──
+        # If jk says tidak, override to tidak
+        for a in ingr_lower_aliases:
+            if a in jk_tidak_map:
+                orig_jk = jk_tidak_map[a][0]
+                if orig_jk in jk_tidak_names:
+                    ingr_status = 'tidak_cocok'
+                    break
+
+        ingredients_detail.append({'nama': ingr, 'status': ingr_status})
+
+    # ── Normalize masalah kulit score to [-100, 100] ──
     if max_possible > 0:
-        norm_jenis   = max(-100.0, min(100.0, (score_jenis   / max_possible) * 100))
         norm_masalah = max(-100.0, min(100.0, (score_masalah / max_possible) * 100))
     else:
-        norm_jenis   = 0.0
         norm_masalah = 0.0
 
-    # ── Combine with weights ──
-    if has_masalah:
-        w_j, w_m = W_JENIS, W_MASALAH
-    else:
-        w_j, w_m = 1.0, 0.0
-
-    final_score = norm_jenis * w_j + norm_masalah * w_m
+    # ── Final score = WSM masalah kulit only ──
+    final_score = norm_masalah
 
     harga   = produk.get('Harga')
     gambar  = produk.get('Gambar')
@@ -431,16 +533,27 @@ def _analisis_produk_v2(
         'bahan_tidak_cocok':  tidak_found,
         'ingredients_detail': ingredients_detail,
         'skor':               round(final_score, 2),
-        'skor_jenis':         round(norm_jenis, 2),
         'skor_masalah':       round(norm_masalah, 2),
+        # Skin type info (constraint, bukan ranking)
+        'skin_type_compatible': skin_type_info['compatible'],
+        'skin_type_info':       skin_type_info,
         'rekomendasi':        'Direkomendasikan' if final_score > 0 else 'Tidak Direkomendasikan',
     }
 
 
-# ─── Helper: prepare caches & keys for v2 analysis ───────────────────────────
+def _spec_label(mult: float) -> str:
+    """Convert specificity multiplier to human-readable label."""
+    if mult >= SPEC_THERAPEUTIC:
+        return 'Terapeutik'
+    elif mult >= SPEC_MODERATE:
+        return 'Moderat'
+    return 'Generik'
 
-def _prepare_v2_caches(jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map):
-    """Create fresh fuzzy-match caches and key lists for _analisis_produk_v2."""
+
+# ─── Helper: prepare caches & keys for v3 analysis ───────────────────────────
+
+def _prepare_v3_caches(jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map):
+    """Create fresh fuzzy-match caches and key lists for _analisis_produk_v3."""
     return (
         {}, {},  # cache_jk_cocok, cache_jk_tidak
         {}, {},  # cache_mk_cocok, cache_mk_tidak
@@ -457,12 +570,19 @@ def debug():
     try:
         data = _get_data()
         rules_df = data['rules_df']
+        spec_map = data.get('specificity_map', {})
+        # Count per tier
+        tier_counts = {'Terapeutik': 0, 'Moderat': 0, 'Generik': 0}
+        for mult in spec_map.values():
+            tier_counts[_spec_label(mult)] += 1
         return jsonify({
             'status':       'ok',
             'produk':       len(data['produk_df']),
             'rules_rows':   len(rules_df),
             'columns':      rules_df.columns.tolist(),
             'dataset_path': _DATASET,
+            'algorithm':    'v3: Constraint-Based Filtering + WSM Masalah Kulit',
+            'specificity_tiers': tier_counts,
         }), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 503
@@ -480,6 +600,10 @@ def get_recommendations():
         "kategori":      "Moisturizer",      // opsional
         "ingredients":   [...]              // opsional, dari scan OCR
     }
+
+    Algoritma v3:
+      1. Filter produk berdasarkan jenis kulit (constraint)
+      2. Ranking produk yang lolos filter berdasarkan WSM masalah kulit + spesifisitas
     """
     try:
         data_set = _get_data()
@@ -500,6 +624,7 @@ def get_recommendations():
         data_set['rules_df'], jenis_kulit, masalah_kulit
     )
     has_masalah = bool(masalah_kulit)
+    specificity_map = data_set.get('specificity_map', {})
 
     produk_df = data_set['produk_df']
     produk_filter = (
@@ -513,24 +638,29 @@ def get_recommendations():
     (cache_jk_cocok, cache_jk_tidak,
      cache_mk_cocok, cache_mk_tidak,
      jk_cocok_keys, jk_tidak_keys,
-     mk_cocok_keys, mk_tidak_keys) = _prepare_v2_caches(
+     mk_cocok_keys, mk_tidak_keys) = _prepare_v3_caches(
         jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map
     )
 
-    hasil = []
+    hasil_lolos = []
+    hasil_filtered_out = []
+
     for _, row in produk_filter.iterrows():
-        h = _analisis_produk_v2(
+        h = _analisis_produk_v3(
             row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
             cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
             jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
-            has_masalah,
+            has_masalah, specificity_map,
         )
         if h:
-            hasil.append(h)
+            if h['skin_type_compatible']:
+                hasil_lolos.append(h)
+            else:
+                hasil_filtered_out.append(h)
 
-    hasil.sort(key=lambda x: x['skor'], reverse=True)
-    direk   = [h for h in hasil if h['skor'] > 0]
-    lainnya = [h for h in hasil if h['skor'] <= 0]
+    hasil_lolos.sort(key=lambda x: x['skor'], reverse=True)
+    direk   = [h for h in hasil_lolos if h['skor'] > 0]
+    lainnya = [h for h in hasil_lolos if h['skor'] <= 0]
 
     return jsonify({
         'jenis_kulit':   jenis_kulit,
@@ -539,6 +669,13 @@ def get_recommendations():
         'total':         len(direk),
         'results':       direk[:20],
         'tidak_cocok':   lainnya[:5],
+        'filtered_out':  hasil_filtered_out[:5],
+        'filter_info': {
+            'method': 'constraint-based',
+            'skin_type_filter': 'hard_reject_top20',
+            'ranking_method': 'WSM_masalah_kulit_with_specificity',
+            'filtered_out_count': len(hasil_filtered_out),
+        },
     }), 200
 
 
@@ -605,13 +742,14 @@ def analyze_ingredients():
         data_set['rules_df'], jenis_kulit, masalah_kulit
     )
     has_masalah = bool(masalah_kulit)
+    specificity_map = data_set.get('specificity_map', {})
 
-    hasil = _analisis_produk_v2(
+    hasil = _analisis_produk_v3(
         dummy_produk, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
         {}, {}, {}, {},
         list(jk_cocok_map.keys()), list(jk_tidak_map.keys()),
         list(mk_cocok_map.keys()), list(mk_tidak_map.keys()),
-        has_masalah,
+        has_masalah, specificity_map,
     )
 
     return jsonify({
@@ -655,30 +793,32 @@ def batch_scores():
         data_set['rules_df'], jenis_kulit, masalah_kulit
     )
     has_masalah = bool(masalah_kulit)
+    specificity_map = data_set.get('specificity_map', {})
 
     produk_df = data_set['produk_df']
 
     (cache_jk_cocok, cache_jk_tidak,
      cache_mk_cocok, cache_mk_tidak,
      jk_cocok_keys, jk_tidak_keys,
-     mk_cocok_keys, mk_tidak_keys) = _prepare_v2_caches(
+     mk_cocok_keys, mk_tidak_keys) = _prepare_v3_caches(
         jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map
     )
 
     # Build results: match by normalized ingredients string so frontend can lookup by ingredients
     results = []
     for _, row in produk_df.iterrows():
-        h = _analisis_produk_v2(
+        h = _analisis_produk_v3(
             row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
             cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
             jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
-            has_masalah,
+            has_masalah, specificity_map,
         )
         if h:
             ingr_key = ','.join(sorted([i.strip().lower() for i in _parse_ingredients(row.get('Ingridients', ''))]))
             results.append({
                 'nama': h['nama_produk'],
                 'skor': h['skor'],
+                'skin_type_compatible': h['skin_type_compatible'],
                 'ingr_key': ingr_key,
             })
 
