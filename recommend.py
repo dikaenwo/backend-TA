@@ -467,8 +467,11 @@ def _analisis_produk_v3(
     score_wsm = 0.0
 
     # Pre-compute max possible score for normalization
+    # In masalah_kulit mode, we use SPEC_THERAPEUTIC to find the absolute maximum
+    # In fallback mode, there is no specificity, so max multiplier is 1.0
+    max_spec = SPEC_THERAPEUTIC if scoring_mode == 'masalah_kulit' else 1.0
     max_possible = sum(
-        _bobot_posisi(i, total)[0] * SPEC_THERAPEUTIC
+        _bobot_posisi(i, total)[0] * max_spec
         for i in range(total)
     )
 
@@ -567,6 +570,8 @@ def _analisis_produk_v3(
         'ingredients_detail': ingredients_detail,
         'skor':               round(final_score, 2),
         'skor_masalah':       round(norm_score, 2),
+        'skor_mentah':        round(score_wsm, 2),
+        'skor_maksimal':      round(max_possible, 2),
         'scoring_mode':       scoring_mode,
         # Skin type info (constraint, bukan ranking)
         'skin_type_compatible': skin_type_info['compatible'],
