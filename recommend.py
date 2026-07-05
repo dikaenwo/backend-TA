@@ -275,7 +275,17 @@ def _analisis_produk_v2(
     if total == 0:
         return None
 
-    cocok_found, tidak_found = [], []
+    # Dedup tracking: prevent synonym ingredients (e.g. Niacinamide/Nicotinamide)
+    # from scoring multiple times on the same axis.
+    seen_jk_cocok = set()   # orig_name already scored as cocok on jenis axis
+    seen_jk_tidak = set()   # orig_name already scored as tidak on jenis axis
+    seen_mk_cocok = set()   # orig_name already scored as cocok on masalah axis
+    seen_mk_tidak = set()   # orig_name already scored as tidak on masalah axis
+
+    # Merged display dicts: orig_name → merged entry (both axes in one item)
+    cocok_merged = {}   # orig_name → {ingredient, bobot, manfaat_jk, manfaat_mk, bobot_max}
+    tidak_merged = {}   # orig_name → {ingredient, bobot, efek_jk, efek_mk, bobot_max}
+
     ingredients_detail = []
     score_jenis = 0.0
     score_masalah = 0.0
@@ -295,18 +305,30 @@ def _analisis_produk_v2(
         )
         if jk_type == 'cocok':
             orig, manfaat = jk_cocok_map[jk_key]
-            score_jenis += pos_w
-            cocok_found.append({
-                'ingredient': orig, 'bobot': round(pos_w, 2),
-                'manfaat': str(manfaat), 'axis': 'jenis_kulit',
-            })
+            if orig not in seen_jk_cocok:
+                seen_jk_cocok.add(orig)
+                score_jenis += pos_w
+                if orig in cocok_merged:
+                    cocok_merged[orig]['manfaat_jk'] = str(manfaat)
+                    cocok_merged[orig]['bobot'] = max(cocok_merged[orig]['bobot'], round(pos_w, 2))
+                else:
+                    cocok_merged[orig] = {
+                        'ingredient': orig, 'bobot': round(pos_w, 2),
+                        'manfaat_jk': str(manfaat), 'manfaat_mk': None,
+                    }
         elif jk_type == 'tidak':
             orig, efek = jk_tidak_map[jk_key]
-            score_jenis -= neg_w
-            tidak_found.append({
-                'ingredient': orig, 'bobot': round(neg_w, 2),
-                'efek_samping': str(efek), 'axis': 'jenis_kulit',
-            })
+            if orig not in seen_jk_tidak:
+                seen_jk_tidak.add(orig)
+                score_jenis -= neg_w
+                if orig in tidak_merged:
+                    tidak_merged[orig]['efek_jk'] = str(efek)
+                    tidak_merged[orig]['bobot'] = max(tidak_merged[orig]['bobot'], round(neg_w, 2))
+                else:
+                    tidak_merged[orig] = {
+                        'ingredient': orig, 'bobot': round(neg_w, 2),
+                        'efek_jk': str(efek), 'efek_mk': None,
+                    }
 
         # ── Masalah Kulit axis ──
         mk_type = None
@@ -317,18 +339,30 @@ def _analisis_produk_v2(
             )
             if mk_type == 'cocok':
                 orig, manfaat = mk_cocok_map[mk_key]
-                score_masalah += pos_w
-                cocok_found.append({
-                    'ingredient': orig, 'bobot': round(pos_w, 2),
-                    'manfaat': str(manfaat), 'axis': 'masalah_kulit',
-                })
+                if orig not in seen_mk_cocok:
+                    seen_mk_cocok.add(orig)
+                    score_masalah += pos_w
+                    if orig in cocok_merged:
+                        cocok_merged[orig]['manfaat_mk'] = str(manfaat)
+                        cocok_merged[orig]['bobot'] = max(cocok_merged[orig]['bobot'], round(pos_w, 2))
+                    else:
+                        cocok_merged[orig] = {
+                            'ingredient': orig, 'bobot': round(pos_w, 2),
+                            'manfaat_jk': None, 'manfaat_mk': str(manfaat),
+                        }
             elif mk_type == 'tidak':
                 orig, efek = mk_tidak_map[mk_key]
-                score_masalah -= neg_w
-                tidak_found.append({
-                    'ingredient': orig, 'bobot': round(neg_w, 2),
-                    'efek_samping': str(efek), 'axis': 'masalah_kulit',
-                })
+                if orig not in seen_mk_tidak:
+                    seen_mk_tidak.add(orig)
+                    score_masalah -= neg_w
+                    if orig in tidak_merged:
+                        tidak_merged[orig]['efek_mk'] = str(efek)
+                        tidak_merged[orig]['bobot'] = max(tidak_merged[orig]['bobot'], round(neg_w, 2))
+                    else:
+                        tidak_merged[orig] = {
+                            'ingredient': orig, 'bobot': round(neg_w, 2),
+                            'efek_jk': None, 'efek_mk': str(efek),
+                        }
 
         # ── Determine ingredient status (conservative: tidak > cocok > netral) ──
         if jk_type == 'tidak' or mk_type == 'tidak':
@@ -337,6 +371,33 @@ def _analisis_produk_v2(
             ingredients_detail.append({'nama': ingr, 'status': 'cocok'})
         else:
             ingredients_detail.append({'nama': ingr, 'status': 'netral'})
+
+    # ── Build final cocok_found / tidak_found lists (deduplicated, merged axes) ──
+    cocok_found = []
+    for entry in cocok_merged.values():
+        manfaat_parts = []
+        if entry['manfaat_jk'] and entry['manfaat_jk'] != '-':
+            manfaat_parts.append(entry['manfaat_jk'])
+        if entry['manfaat_mk'] and entry['manfaat_mk'] != '-':
+            manfaat_parts.append(entry['manfaat_mk'])
+        cocok_found.append({
+            'ingredient': entry['ingredient'],
+            'bobot': entry['bobot'],
+            'manfaat': ' | '.join(manfaat_parts) if manfaat_parts else '-',
+        })
+
+    tidak_found = []
+    for entry in tidak_merged.values():
+        efek_parts = []
+        if entry['efek_jk'] and entry['efek_jk'] != '-':
+            efek_parts.append(entry['efek_jk'])
+        if entry['efek_mk'] and entry['efek_mk'] != '-':
+            efek_parts.append(entry['efek_mk'])
+        tidak_found.append({
+            'ingredient': entry['ingredient'],
+            'bobot': entry['bobot'],
+            'efek_samping': ' | '.join(efek_parts) if efek_parts else '-',
+        })
 
     # ── Normalize each axis to [-100, 100] ──
     if max_possible > 0:
