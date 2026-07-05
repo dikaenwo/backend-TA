@@ -4,13 +4,17 @@ Prefix: /api/recommend
 
 Algoritma v3 (Constraint-Based Filtering + WSM):
   - Arsitektur berdasarkan Burke (2002): constraint vs preference/utility
-  - Jenis Kulit  → Rule-Based Filtering (eligibility constraint)
-    • Hard reject jika ingredient top-20% tidak cocok jenis kulit user
-    • Ingredient di posisi >20% yang tidak cocok → warning saja
-  - Masalah Kulit → WSM single-axis (ranking criterion)
-    • Bobot posisi ingredient: atas 20% → 1.0, 20-50% → 0.5, sisanya → 0.2
-    • Bobot spesifisitas ingredient: terapeutik (1.5x), moderat (1.0x), generik (0.7x)
-    • Normalisasi ke [-100, 100] agar panjang ingredient list tidak bias
+  - Jika user PUNYA masalah kulit:
+    • Jenis Kulit  → Rule-Based Filtering (eligibility constraint)
+      - Hard reject jika ingredient top-20% tidak cocok jenis kulit user
+      - Ingredient di posisi >20% yang tidak cocok → warning saja
+    • Masalah Kulit → WSM single-axis (ranking criterion)
+  - Jika user TIDAK PUNYA masalah kulit (fallback mode):
+    • Jenis Kulit  → WSM single-axis (ranking criterion, bukan filter)
+    • Semua produk tetap mendapat skor berdasarkan kesesuaian jenis kulit
+  - Bobot posisi ingredient: atas 20% → 1.0, 20-50% → 0.5, sisanya → 0.2
+  - Bobot spesifisitas ingredient: terapeutik (1.5x), moderat (1.0x), generik (0.7x)
+  - Normalisasi ke [-100, 100] agar panjang ingredient list tidak bias
   - Handle alias: nama/alternatif (/) dan nama (dalam kurung)
   - Produk lolos filter diurutkan dari skor tertinggi
 """
@@ -403,41 +407,68 @@ def _analisis_produk_v3(
 ) -> dict:
     """
     Analisis satu produk dengan arsitektur v3:
-      Layer 1: Skin type constraint filter (hard/soft)
-      Layer 2: WSM scoring hanya dari masalah kulit + spesifisitas ingredient
 
-    Perubahan dari v2:
-      - Jenis kulit TIDAK lagi masuk WSM scoring
-      - Jenis kulit menjadi eligibility constraint (filter)
-      - Masalah kulit adalah satu-satunya ranking criterion
-      - Bobot posisi di-multiply dengan specificity multiplier
+    Mode 1 (has_masalah=True):
+      Layer 1: Skin type constraint filter (hard/soft)
+      Layer 2: WSM scoring dari masalah kulit + spesifisitas ingredient
+
+    Mode 2 — Fallback (has_masalah=False):
+      Tidak ada filter. Jenis kulit menjadi kriteria WSM.
+      Semua produk tetap mendapat skor berdasarkan kesesuaian jenis kulit.
     """
     ingredients_list = _parse_ingredients(produk.get('Ingridients', ''))
     total = len(ingredients_list)
     if total == 0:
         return None
 
-    # ── Layer 1: Skin Type Filter ──
-    skin_type_info = _filter_skin_type(
-        ingredients_list,
-        jk_cocok_map, jk_tidak_map,
-        cache_jk_cocok, cache_jk_tidak,
-        jk_cocok_keys, jk_tidak_keys,
-    )
+    # ── Tentukan mode scoring ──
+    # Jika ada masalah kulit: jenis kulit = filter, masalah kulit = WSM
+    # Jika TIDAK ada masalah kulit: jenis kulit = WSM (fallback), tidak ada filter
+    if has_masalah:
+        # Mode 1: Skin type sebagai filter
+        skin_type_info = _filter_skin_type(
+            ingredients_list,
+            jk_cocok_map, jk_tidak_map,
+            cache_jk_cocok, cache_jk_tidak,
+            jk_cocok_keys, jk_tidak_keys,
+        )
+        # WSM maps = masalah kulit
+        wsm_cocok_map = mk_cocok_map
+        wsm_tidak_map = mk_tidak_map
+        wsm_cache_cocok = cache_mk_cocok
+        wsm_cache_tidak = cache_mk_tidak
+        wsm_cocok_keys = mk_cocok_keys
+        wsm_tidak_keys = mk_tidak_keys
+        scoring_mode = 'masalah_kulit'
+    else:
+        # Mode 2 — Fallback: Skin type sebagai WSM ranking, TIDAK ada filter
+        skin_type_info = {
+            'compatible': True,
+            'jk_cocok_list': [], 'jk_warnings': [], 'jk_hard_reject': [],
+            'jk_cocok_count': 0, 'jk_tidak_count': 0,
+        }
+        # WSM maps = jenis kulit (fallback)
+        wsm_cocok_map = jk_cocok_map
+        wsm_tidak_map = jk_tidak_map
+        wsm_cache_cocok = cache_jk_cocok
+        wsm_cache_tidak = cache_jk_tidak
+        wsm_cocok_keys = jk_cocok_keys
+        wsm_tidak_keys = jk_tidak_keys
+        scoring_mode = 'jenis_kulit'
 
-    # ── Layer 2: WSM Masalah Kulit Only ──
-    seen_mk_cocok = set()
-    seen_mk_tidak = set()
+    # ── WSM Scoring ──
+    seen_wsm_cocok = set()
+    seen_wsm_tidak = set()
 
-    cocok_found = []    # bahan cocok masalah kulit
-    tidak_found = []    # bahan tidak cocok masalah kulit
+    cocok_found = []
+    tidak_found = []
 
     ingredients_detail = []
-    score_masalah = 0.0
+    score_wsm = 0.0
 
     # Pre-compute max possible score for normalization
     max_possible = sum(
-        _bobot_posisi(i, total)[0] * SPEC_THERAPEUTIC  # max possible with highest multiplier
+        _bobot_posisi(i, total)[0] * SPEC_THERAPEUTIC
         for i in range(total)
     )
 
@@ -445,77 +476,79 @@ def _analisis_produk_v3(
         pos_w, neg_w = _bobot_posisi(idx, total)
         k_aliases = _get_aliases(ingr)
 
-        # ── Masalah Kulit axis (WSM) ──
-        mk_type = None
-        if has_masalah:
-            mk_type, mk_key = _match_ingredient(
-                k_aliases, mk_cocok_map, mk_tidak_map,
-                cache_mk_cocok, cache_mk_tidak, mk_cocok_keys, mk_tidak_keys
-            )
-            if mk_type == 'cocok':
-                orig, manfaat = mk_cocok_map[mk_key]
-                if orig not in seen_mk_cocok:
-                    seen_mk_cocok.add(orig)
-                    # Apply specificity multiplier
+        # ── WSM axis ──
+        wsm_type = None
+        wsm_type, wsm_key = _match_ingredient(
+            k_aliases, wsm_cocok_map, wsm_tidak_map,
+            wsm_cache_cocok, wsm_cache_tidak, wsm_cocok_keys, wsm_tidak_keys
+        )
+        if wsm_type == 'cocok':
+            orig, manfaat = wsm_cocok_map[wsm_key]
+            if orig not in seen_wsm_cocok:
+                seen_wsm_cocok.add(orig)
+                # Apply specificity multiplier (only meaningful for masalah kulit mode)
+                if scoring_mode == 'masalah_kulit':
                     spec_mult = specificity_map.get(orig.lower(), SPEC_MODERATE)
-                    effective_w = pos_w * spec_mult
-                    score_masalah += effective_w
-                    cocok_found.append({
-                        'ingredient': orig,
-                        'bobot': round(pos_w, 2),
-                        'bobot_efektif': round(effective_w, 2),
-                        'spesifisitas': _spec_label(spec_mult),
-                        'manfaat': str(manfaat) if manfaat and str(manfaat) != '-' else '-',
-                    })
-            elif mk_type == 'tidak':
-                orig, efek = mk_tidak_map[mk_key]
-                if orig not in seen_mk_tidak:
-                    seen_mk_tidak.add(orig)
+                else:
+                    # Fallback mode: no specificity needed, jenis kulit has no spec tiers
+                    spec_mult = 1.0
+                effective_w = pos_w * spec_mult
+                score_wsm += effective_w
+                cocok_found.append({
+                    'ingredient': orig,
+                    'bobot': round(pos_w, 2),
+                    'bobot_efektif': round(effective_w, 2),
+                    'spesifisitas': _spec_label(spec_mult) if scoring_mode == 'masalah_kulit' else '-',
+                    'manfaat': str(manfaat) if manfaat and str(manfaat) != '-' else '-',
+                })
+        elif wsm_type == 'tidak':
+            orig, efek = wsm_tidak_map[wsm_key]
+            if orig not in seen_wsm_tidak:
+                seen_wsm_tidak.add(orig)
+                if scoring_mode == 'masalah_kulit':
                     spec_mult = specificity_map.get(orig.lower(), SPEC_MODERATE)
-                    effective_w = neg_w * spec_mult
-                    score_masalah -= effective_w
-                    tidak_found.append({
-                        'ingredient': orig,
-                        'bobot': round(neg_w, 2),
-                        'bobot_efektif': round(effective_w, 2),
-                        'spesifisitas': _spec_label(spec_mult),
-                        'efek_samping': str(efek) if efek and str(efek) != '-' else '-',
-                    })
+                else:
+                    spec_mult = 1.0
+                effective_w = neg_w * spec_mult
+                score_wsm -= effective_w
+                tidak_found.append({
+                    'ingredient': orig,
+                    'bobot': round(neg_w, 2),
+                    'bobot_efektif': round(effective_w, 2),
+                    'spesifisitas': _spec_label(spec_mult) if scoring_mode == 'masalah_kulit' else '-',
+                    'efek_samping': str(efek) if efek and str(efek) != '-' else '-',
+                })
 
         # ── Determine ingredient status ──
-        # Check jk status from skin_type_info
         jk_tidak_names = {e['ingredient'] for e in skin_type_info['jk_hard_reject']}
         jk_tidak_names |= {e['ingredient'] for e in skin_type_info['jk_warnings']}
-        jk_cocok_names = {e['ingredient'] for e in skin_type_info['jk_cocok_list']}
 
-        # Match this ingredient to its original name (if matched)
         ingr_lower_aliases = _get_aliases(ingr)
         ingr_status = 'netral'
 
-        # Check mk status
-        if mk_type == 'tidak':
+        if wsm_type == 'tidak':
             ingr_status = 'tidak_cocok'
-        elif mk_type == 'cocok':
+        elif wsm_type == 'cocok':
             ingr_status = 'cocok'
 
-        # If jk says tidak, override to tidak
-        for a in ingr_lower_aliases:
-            if a in jk_tidak_map:
-                orig_jk = jk_tidak_map[a][0]
-                if orig_jk in jk_tidak_names:
-                    ingr_status = 'tidak_cocok'
-                    break
+        # If in masalah kulit mode, also check jk filter status
+        if has_masalah:
+            for a in ingr_lower_aliases:
+                if a in jk_tidak_map:
+                    orig_jk = jk_tidak_map[a][0]
+                    if orig_jk in jk_tidak_names:
+                        ingr_status = 'tidak_cocok'
+                        break
 
         ingredients_detail.append({'nama': ingr, 'status': ingr_status})
 
-    # ── Normalize masalah kulit score to [-100, 100] ──
+    # ── Normalize score to [-100, 100] ──
     if max_possible > 0:
-        norm_masalah = max(-100.0, min(100.0, (score_masalah / max_possible) * 100))
+        norm_score = max(-100.0, min(100.0, (score_wsm / max_possible) * 100))
     else:
-        norm_masalah = 0.0
+        norm_score = 0.0
 
-    # ── Final score = WSM masalah kulit only ──
-    final_score = norm_masalah
+    final_score = norm_score
 
     harga   = produk.get('Harga')
     gambar  = produk.get('Gambar')
@@ -533,7 +566,8 @@ def _analisis_produk_v3(
         'bahan_tidak_cocok':  tidak_found,
         'ingredients_detail': ingredients_detail,
         'skor':               round(final_score, 2),
-        'skor_masalah':       round(norm_masalah, 2),
+        'skor_masalah':       round(norm_score, 2),
+        'scoring_mode':       scoring_mode,
         # Skin type info (constraint, bukan ranking)
         'skin_type_compatible': skin_type_info['compatible'],
         'skin_type_info':       skin_type_info,
