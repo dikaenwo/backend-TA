@@ -165,6 +165,69 @@ def _contra_label(level: str) -> str:
     return '-'
 
 
+# ─── Dataset Audit (Revisi 3) ─────────────────────────────────────────────────
+# Audit ringan, read-only, TIDAK menyentuh pipeline scoring/filtering.
+# Tidak ada nama ingredient yang di-hardcode — semua statistik murni
+# hasil agregasi terhadap isi dataset saat ini, jadi tetap valid kalau
+# datasetnya diperbarui.
+
+def _audit_evidence_dataset(rules_df: pd.DataFrame, evidence_maps: dict) -> dict:
+    """
+    Audit kelengkapan & konsistensi kolom Evidence Strength dan
+    Contraindication Strength pada Dataset Terbaru.csv.
+
+    Tidak melakukan penilaian benar/salah terhadap suatu ingredient —
+    hanya melaporkan apa yang ADA dan apa yang KOSONG di dataset,
+    plus baris duplikat yang berpotensi menimbulkan entri kontradiktif.
+    """
+    names = rules_df.get('Ingredient', pd.Series(dtype=str)).dropna().astype(str).str.strip()
+    names = names[(names != '') & (names.str.lower() != 'nan')]
+    total_unique = names.str.lower().nunique()
+
+    evidence_map = (evidence_maps or {}).get('evidence', {})
+    contra_map   = (evidence_maps or {}).get('contraindication', {})
+
+    with_evidence = len(evidence_map)
+    with_contra   = len(contra_map)
+
+    # Baris dengan nama ingredient yang sama (potensi entri konflik/duplikat)
+    lower_names = names.str.lower()
+    dup_series  = lower_names[lower_names.duplicated(keep=False)]
+    duplicate_ingredients = sorted(dup_series.value_counts().to_dict().items())
+
+    # Distribusi level evidence & contraindication APA ADANYA di dataset
+    # (bukan daftar tetap — hanya merefleksikan nilai unik yang muncul)
+    evidence_level_counts = {}
+    for mk_map in evidence_map.values():
+        for level in mk_map.values():
+            evidence_level_counts[level] = evidence_level_counts.get(level, 0) + 1
+
+    contra_level_counts = {}
+    for mk_map in contra_map.values():
+        for level in mk_map.values():
+            contra_level_counts[level] = contra_level_counts.get(level, 0) + 1
+
+    return {
+        'total_unique_ingredients': int(total_unique),
+        'ingredients_with_evidence_data': with_evidence,
+        'ingredients_with_contraindication_data': with_contra,
+        'evidence_coverage_pct': round(with_evidence / total_unique * 100, 1) if total_unique else 0.0,
+        'contraindication_coverage_pct': round(with_contra / total_unique * 100, 1) if total_unique else 0.0,
+        'evidence_level_distribution': evidence_level_counts,
+        'contraindication_level_distribution': contra_level_counts,
+        'duplicate_ingredient_rows': [
+            {'ingredient': name, 'jumlah_baris': int(count)}
+            for name, count in duplicate_ingredients
+        ],
+        'catatan': (
+            'Audit ini hanya melaporkan kelengkapan & duplikasi data apa adanya. '
+            'Tidak ada asumsi default (mis. "selalu High") untuk ingredient mana pun; '
+            'level yang tidak tercatat di dataset akan tetap diperlakukan sebagai '
+            'CONTRA_DEFAULT/EVIDENCE_DEFAULT oleh mesin scoring.'
+        ),
+    }
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _bobot_posisi(index: int, total: int) -> tuple[float, float]:
@@ -521,14 +584,23 @@ def _analisis_produk_v3(
     ingredients_detail = []
     score_wsm = 0.0
 
-    # Pre-compute max possible score for normalization
-    # In masalah_kulit mode, we use EVIDENCE_PRIMARY to find the absolute maximum
-    # In fallback mode, there is no evidence, so max multiplier is 1.0
+    # ── Normalisasi denominator: "actual achievable maximum" ──
+    # Revisi metodologi (lihat catatan review): denominator TIDAK lagi
+    # dihitung dari seluruh posisi ingredient (theoretical maximum),
+    # melainkan hanya dari posisi yang benar-benar "rule-relevant" —
+    # yaitu ingredient yang cocok ATAU tidak cocok menurut dataset untuk
+    # jenis_kulit/masalah_kulit user. Ingredient netral (tidak tercatat
+    # di dataset sama sekali) tidak pernah bisa berkontribusi pada
+    # score_wsm, sehingga tidak boleh memperbesar ceiling — kalau tetap
+    # dihitung, produk dengan banyak ingredient netral/filler akan
+    # dirugikan secara sistematis walau kandungan aktifnya identik
+    # (length bias). Ini analog dengan normalisasi ideal-DCG pada IR:
+    # ceiling dihitung atas himpunan item yang relevan/dinilai, bukan
+    # atas seluruh koleksi. Struktur WSM, position weight, evidence,
+    # dan contraindication multiplier TIDAK berubah — hanya cakupan
+    # penjumlahan pada denominator.
     max_ev = EVIDENCE_PRIMARY if scoring_mode == 'masalah_kulit' else 1.0
-    max_possible = sum(
-        _bobot_posisi(i, total)[0] * max_ev
-        for i in range(total)
-    )
+    max_possible = 0.0
 
     # Resolve evidence maps for this analysis
     ev_map = (evidence_maps or {}).get('evidence', {})
@@ -544,6 +616,14 @@ def _analisis_produk_v3(
             k_aliases, wsm_cocok_map, wsm_tidak_map,
             wsm_cache_cocok, wsm_cache_tidak, wsm_cocok_keys, wsm_tidak_keys
         )
+
+        # Ingredient ini rule-relevant (match cocok atau tidak cocok) →
+        # ikut menyumbang ke ceiling normalisasi menggunakan bobot
+        # positif posisinya (karena ceiling merepresentasikan skenario
+        # terbaik: ingredient tersebut cocok dengan evidence maksimal).
+        if wsm_type is not None:
+            max_possible += pos_w * max_ev
+
         if wsm_type == 'cocok':
             orig, manfaat = wsm_cocok_map[wsm_key]
             if orig not in seen_wsm_cocok:
@@ -642,6 +722,7 @@ def _analisis_produk_v3(
         'skor_masalah':       round(norm_score, 2),
         'skor_mentah':        round(score_wsm, 2),
         'skor_maksimal':      round(max_possible, 2),
+        'normalisasi_metode': 'actual_achievable_max_rule_relevant',
         'scoring_mode':       scoring_mode,
         # Skin type info (constraint, bukan ranking)
         'skin_type_compatible': skin_type_info['compatible'],
@@ -680,6 +761,25 @@ def debug():
         }), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 503
+
+
+# ─── GET /api/recommend/audit ─────────────────────────────────────────────────
+
+@recommend_bp.route('/audit', methods=['GET'])
+def audit_dataset():
+    """
+    Audit ringan (read-only) terhadap kualitas data Evidence Strength &
+    Contraindication Strength di Dataset Terbaru.csv. Tidak mempengaruhi
+    endpoint scoring/filtering lain. Ditujukan untuk keperluan akademik
+    (bab metodologi / validasi data skripsi).
+    """
+    try:
+        data_set = _get_data()
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 503
+
+    result = _audit_evidence_dataset(data_set['rules_df'], data_set.get('evidence_maps', {}))
+    return jsonify(result), 200
 
 
 # ─── POST /api/recommend ──────────────────────────────────────────────────────
