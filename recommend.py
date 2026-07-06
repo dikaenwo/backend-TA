@@ -49,6 +49,20 @@ SPEC_THERAPEUTIC = 1.5   # e.g., Salicylic Acid (hanya Berjerawat, PIH)
 SPEC_MODERATE    = 1.0   # e.g., Centella Asiatica (beberapa masalah)
 SPEC_GENERIC     = 0.7   # e.g., Niacinamide (semua masalah)
 
+# ─── Evidence Strength Multipliers (for masalah kulit cocok) ─────────────────
+# Koreksi kecil berdasarkan kekuatan bukti dermatologi.
+# Diterapkan SETELAH bobot posisi & spesifisitas → tidak menggantikan posisi.
+EVIDENCE_PRIMARY     = 1.15   # Strong dermatological evidence
+EVIDENCE_SUPPORTIVE  = 1.0    # Supportive / anecdotal evidence
+EVIDENCE_DEFAULT     = 1.0    # No evidence data available
+
+# ─── Contraindication Strength Multipliers (for masalah kulit tidak cocok) ────
+# Memperbesar penalti untuk ingredient dengan bukti kontraindikasi kuat.
+CONTRA_HIGH     = 1.4    # Strong contraindication evidence
+CONTRA_MODERATE = 1.2    # Moderate contraindication evidence
+CONTRA_LOW      = 1.0    # Low / weak contraindication evidence
+CONTRA_DEFAULT  = 1.0    # No contraindication data available
+
 
 def _get_data():
     """Load dataset sekali lalu cache. Raise RuntimeError jika gagal."""
@@ -62,9 +76,15 @@ def _get_data():
         # Build specificity map once on first load
         _cache['specificity_map'] = _build_specificity_map(rules_df)
 
+        # Build evidence & contraindication maps once on first load
+        _cache['evidence_maps'] = _build_evidence_maps(rules_df)
+
         print("[Recommend] Dataset Terbaru.csv & Dataset Produk.xlsx berhasil dimuat.")
         print(f"  Rules: {len(rules_df)} baris | Produk: {len(_cache['produk_df'])} baris")
         print(f"  Specificity map: {len(_cache['specificity_map'])} ingredients")
+        ev_maps = _cache['evidence_maps']
+        print(f"  Evidence map: {len(ev_maps.get('evidence', {}))} ingredients")
+        print(f"  Contraindication map: {len(ev_maps.get('contraindication', {}))} ingredients")
     except Exception as e:
         _cache.clear()
         raise RuntimeError(f"Gagal memuat dataset: {e}") from e
@@ -109,6 +129,94 @@ def _build_specificity_map(rules_df: pd.DataFrame) -> dict:
         specificity[name.lower()] = mult
 
     return specificity
+
+
+# ─── Evidence & Contraindication Map Builders ────────────────────────────────
+
+def _build_evidence_maps(rules_df: pd.DataFrame) -> dict:
+    """
+    Parse 'Masalah Kulit Evidence Strength' dan 'Masalah Kulit Contraindication Strength'
+    menjadi nested dict: { ingredient_lower: { masalah_kulit: level } }
+
+    Returns dict with keys 'evidence' and 'contraindication'.
+    """
+    evidence_map = {}           # ingredient_lower -> {masalah: 'Primary'|'Supportive'}
+    contraindication_map = {}   # ingredient_lower -> {masalah: 'High'|'Moderate'|'Low'}
+
+    for _, row in rules_df.iterrows():
+        name = str(row.get('Ingredient', '')).strip()
+        if not name or name == 'nan':
+            continue
+        key = name.lower()
+
+        # Parse Evidence Strength
+        ev_raw = str(row.get('Masalah Kulit Evidence Strength', '') or '').strip()
+        if ev_raw and ev_raw != '-' and ev_raw != 'nan':
+            evidence_map[key] = _parse_strength_pairs(ev_raw)
+
+        # Parse Contraindication Strength
+        ct_raw = str(row.get('Masalah Kulit Contraindication Strength', '') or '').strip()
+        if ct_raw and ct_raw != '-' and ct_raw != 'nan':
+            contraindication_map[key] = _parse_strength_pairs(ct_raw)
+
+    return {'evidence': evidence_map, 'contraindication': contraindication_map}
+
+
+def _parse_strength_pairs(raw: str) -> dict:
+    """
+    Parse 'Berjerawat: Primary; PIH: Supportive'
+    → {'Berjerawat': 'Primary', 'PIH': 'Supportive'}
+    """
+    result = {}
+    pairs = raw.split(';')
+    for pair in pairs:
+        pair = pair.strip()
+        if ':' in pair:
+            masalah, level = pair.rsplit(':', 1)
+            result[masalah.strip()] = level.strip()
+    return result
+
+
+def _get_evidence_multiplier(ingredient_lower: str, masalah_kulit: str,
+                              evidence_map: dict) -> float:
+    """Lookup evidence multiplier for specific ingredient + masalah kulit combination."""
+    mk_map = evidence_map.get(ingredient_lower, {})
+    level = mk_map.get(masalah_kulit, '')
+    if level == 'Primary':
+        return EVIDENCE_PRIMARY
+    return EVIDENCE_DEFAULT
+
+
+def _get_contraindication_multiplier(ingredient_lower: str, masalah_kulit: str,
+                                      contraindication_map: dict) -> float:
+    """Lookup contraindication multiplier for specific ingredient + masalah kulit combination."""
+    mk_map = contraindication_map.get(ingredient_lower, {})
+    level = mk_map.get(masalah_kulit, '')
+    if level == 'High':
+        return CONTRA_HIGH
+    elif level == 'Moderate':
+        return CONTRA_MODERATE
+    return CONTRA_DEFAULT
+
+
+def _evidence_label(level: str) -> str:
+    """Convert evidence level string to display label."""
+    if level == 'Primary':
+        return 'Primary'
+    elif level == 'Supportive':
+        return 'Supportive'
+    return '-'
+
+
+def _contra_label(level: str) -> str:
+    """Convert contraindication level string to display label."""
+    if level == 'High':
+        return 'High'
+    elif level == 'Moderate':
+        return 'Moderate'
+    elif level == 'Low':
+        return 'Low'
+    return '-'
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -392,7 +500,7 @@ def _filter_skin_type(
     }
 
 
-# ─── Product Analysis v3 (WSM Masalah Kulit Only + Specificity) ──────────────
+# ─── Product Analysis v3 (WSM Masalah Kulit Only + Specificity + Evidence) ───
 
 def _analisis_produk_v3(
     produk: pd.Series,
@@ -404,6 +512,8 @@ def _analisis_produk_v3(
     mk_cocok_keys: list, mk_tidak_keys: list,
     has_masalah: bool,
     specificity_map: dict,
+    evidence_maps: dict = None,
+    masalah_kulit: str = '',
 ) -> dict:
     """
     Analisis satu produk dengan arsitektur v3:
@@ -467,13 +577,18 @@ def _analisis_produk_v3(
     score_wsm = 0.0
 
     # Pre-compute max possible score for normalization
-    # In masalah_kulit mode, we use SPEC_THERAPEUTIC to find the absolute maximum
-    # In fallback mode, there is no specificity, so max multiplier is 1.0
+    # In masalah_kulit mode, we use SPEC_THERAPEUTIC * EVIDENCE_PRIMARY to find the absolute maximum
+    # In fallback mode, there is no specificity/evidence, so max multiplier is 1.0
     max_spec = SPEC_THERAPEUTIC if scoring_mode == 'masalah_kulit' else 1.0
+    max_ev = EVIDENCE_PRIMARY if scoring_mode == 'masalah_kulit' else 1.0
     max_possible = sum(
-        _bobot_posisi(i, total)[0] * max_spec
+        _bobot_posisi(i, total)[0] * max_spec * max_ev
         for i in range(total)
     )
+
+    # Resolve evidence maps for this analysis
+    ev_map = (evidence_maps or {}).get('evidence', {})
+    ct_map = (evidence_maps or {}).get('contraindication', {})
 
     for idx, ingr in enumerate(ingredients_list):
         pos_w, neg_w = _bobot_posisi(idx, total)
@@ -492,16 +607,22 @@ def _analisis_produk_v3(
                 # Apply specificity multiplier (only meaningful for masalah kulit mode)
                 if scoring_mode == 'masalah_kulit':
                     spec_mult = specificity_map.get(orig.lower(), SPEC_MODERATE)
+                    # Apply evidence strength multiplier (small correction)
+                    ev_mult = _get_evidence_multiplier(orig.lower(), masalah_kulit, ev_map)
                 else:
-                    # Fallback mode: no specificity needed, jenis kulit has no spec tiers
+                    # Fallback mode: no specificity/evidence needed
                     spec_mult = 1.0
-                effective_w = pos_w * spec_mult
+                    ev_mult = 1.0
+                effective_w = pos_w * spec_mult * ev_mult
                 score_wsm += effective_w
+                # Lookup evidence level label for response
+                ev_level = ev_map.get(orig.lower(), {}).get(masalah_kulit, '') if masalah_kulit else ''
                 cocok_found.append({
                     'ingredient': orig,
                     'bobot': round(pos_w, 2),
                     'bobot_efektif': round(effective_w, 2),
                     'spesifisitas': _spec_label(spec_mult) if scoring_mode == 'masalah_kulit' else '-',
+                    'evidence_strength': _evidence_label(ev_level) if scoring_mode == 'masalah_kulit' else '-',
                     'manfaat': str(manfaat) if manfaat and str(manfaat) != '-' else '-',
                 })
         elif wsm_type == 'tidak':
@@ -510,15 +631,21 @@ def _analisis_produk_v3(
                 seen_wsm_tidak.add(orig)
                 if scoring_mode == 'masalah_kulit':
                     spec_mult = specificity_map.get(orig.lower(), SPEC_MODERATE)
+                    # Apply contraindication strength multiplier (small correction)
+                    contra_mult = _get_contraindication_multiplier(orig.lower(), masalah_kulit, ct_map)
                 else:
                     spec_mult = 1.0
-                effective_w = neg_w * spec_mult
+                    contra_mult = 1.0
+                effective_w = neg_w * spec_mult * contra_mult
                 score_wsm -= effective_w
+                # Lookup contraindication level label for response
+                ct_level = ct_map.get(orig.lower(), {}).get(masalah_kulit, '') if masalah_kulit else ''
                 tidak_found.append({
                     'ingredient': orig,
                     'bobot': round(neg_w, 2),
                     'bobot_efektif': round(effective_w, 2),
                     'spesifisitas': _spec_label(spec_mult) if scoring_mode == 'masalah_kulit' else '-',
+                    'contraindication_strength': _contra_label(ct_level) if scoring_mode == 'masalah_kulit' else '-',
                     'efek_samping': str(efek) if efek and str(efek) != '-' else '-',
                 })
 
@@ -670,6 +797,7 @@ def get_recommendations():
     )
     has_masalah = bool(masalah_kulit)
     specificity_map = data_set.get('specificity_map', {})
+    evidence_maps = data_set.get('evidence_maps', {})
 
     produk_df = data_set['produk_df']
     produk_filter = (
@@ -696,6 +824,7 @@ def get_recommendations():
             cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
             jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
             has_masalah, specificity_map,
+            evidence_maps, masalah_kulit,
         )
         if h:
             if h['skin_type_compatible']:
@@ -788,6 +917,7 @@ def analyze_ingredients():
     )
     has_masalah = bool(masalah_kulit)
     specificity_map = data_set.get('specificity_map', {})
+    evidence_maps = data_set.get('evidence_maps', {})
 
     hasil = _analisis_produk_v3(
         dummy_produk, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map,
@@ -795,6 +925,7 @@ def analyze_ingredients():
         list(jk_cocok_map.keys()), list(jk_tidak_map.keys()),
         list(mk_cocok_map.keys()), list(mk_tidak_map.keys()),
         has_masalah, specificity_map,
+        evidence_maps, masalah_kulit,
     )
 
     return jsonify({
@@ -839,6 +970,7 @@ def batch_scores():
     )
     has_masalah = bool(masalah_kulit)
     specificity_map = data_set.get('specificity_map', {})
+    evidence_maps = data_set.get('evidence_maps', {})
 
     produk_df = data_set['produk_df']
 
@@ -857,6 +989,7 @@ def batch_scores():
             cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
             jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
             has_masalah, specificity_map,
+            evidence_maps, masalah_kulit,
         )
         if h:
             ingr_key = ','.join(sorted([i.strip().lower() for i in _parse_ingredients(row.get('Ingridients', ''))]))
