@@ -292,7 +292,7 @@ def _build_rule_maps_v2(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit:
             is_mk_cocok = masalah_kulit in mk_cocok_list
             alasan_mkc_clean = alasan_mkc if alasan_mkc and alasan_mkc != 'nan' else '-'
             alasan_mkt_clean = alasan_mkt if alasan_mkt and alasan_mkt != 'nan' else '-'
-
+#upd
             if is_mk_tidak:
                 for alias in aliases:
                     if alias not in mk_tidak_map:
