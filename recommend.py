@@ -71,7 +71,6 @@ def _get_data():
         ev_maps = _cache['evidence_maps']
         print(f"  Evidence map: {len(ev_maps.get('evidence', {}))} ingredients")
         print(f"  Contraindication map: {len(ev_maps.get('contraindication', {}))} ingredients")
-        print(f"  Jenis Kulit Contraindication map: {len(ev_maps.get('jk_contraindication', {}))} ingredients")
     except Exception as e:
         _cache.clear()
         raise RuntimeError(f"Gagal memuat dataset: {e}") from e
@@ -82,19 +81,13 @@ def _get_data():
 
 def _build_evidence_maps(rules_df: pd.DataFrame) -> dict:
     """
-    Parse 'Masalah Kulit Evidence Strength', 'Masalah Kulit Contraindication Strength',
-    dan 'Jenis Kulit Contraindication Strength' menjadi nested dict:
-      { ingredient_lower: { masalah_kulit_atau_jenis_kulit: level } }
+    Parse 'Masalah Kulit Evidence Strength' dan 'Masalah Kulit Contraindication Strength'
+    menjadi nested dict: { ingredient_lower: { masalah_kulit: level } }
 
-    Returns dict with keys 'evidence', 'contraindication', 'jk_contraindication'.
-
-    Catatan penting: 'contraindication' diindeks per MASALAH KULIT (axis WSM),
-    sedangkan 'jk_contraindication' diindeks per JENIS KULIT (axis constraint/
-    soft-penalty). Keduanya TIDAK saling menggantikan — domainnya berbeda.
+    Returns dict with keys 'evidence' and 'contraindication'.
     """
     evidence_map = {}           # ingredient_lower -> {masalah: 'Primary'|'Supportive'}
     contraindication_map = {}   # ingredient_lower -> {masalah: 'High'|'Moderate'|'Low'}
-    jk_contraindication_map = {}  # ingredient_lower -> {jenis_kulit: 'High'|'Moderate'|'Low'}
 
     for _, row in rules_df.iterrows():
         name = str(row.get('Ingredient', '')).strip()
@@ -102,26 +95,17 @@ def _build_evidence_maps(rules_df: pd.DataFrame) -> dict:
             continue
         key = name.lower()
 
-        # Parse Evidence Strength (masalah kulit)
+        # Parse Evidence Strength
         ev_raw = str(row.get('Masalah Kulit Evidence Strength', '') or '').strip()
         if ev_raw and ev_raw != '-' and ev_raw != 'nan':
             evidence_map[key] = _parse_strength_pairs(ev_raw)
 
-        # Parse Contraindication Strength (masalah kulit)
+        # Parse Contraindication Strength
         ct_raw = str(row.get('Masalah Kulit Contraindication Strength', '') or '').strip()
         if ct_raw and ct_raw != '-' and ct_raw != 'nan':
             contraindication_map[key] = _parse_strength_pairs(ct_raw)
 
-        # Parse Contraindication Strength (jenis kulit) — kolom baru
-        jkct_raw = str(row.get('Jenis Kulit Contraindication Strength', '') or '').strip()
-        if jkct_raw and jkct_raw != '-' and jkct_raw != 'nan':
-            jk_contraindication_map[key] = _parse_strength_pairs(jkct_raw)
-
-    return {
-        'evidence': evidence_map,
-        'contraindication': contraindication_map,
-        'jk_contraindication': jk_contraindication_map,
-    }
+    return {'evidence': evidence_map, 'contraindication': contraindication_map}
 
 
 def _parse_strength_pairs(raw: str) -> dict:
@@ -154,24 +138,6 @@ def _get_contraindication_multiplier(ingredient_lower: str, masalah_kulit: str,
     """Lookup contraindication multiplier for specific ingredient + masalah kulit combination."""
     mk_map = contraindication_map.get(ingredient_lower, {})
     level = mk_map.get(masalah_kulit, '')
-    if level == 'High':
-        return CONTRA_HIGH
-    elif level == 'Moderate':
-        return CONTRA_MODERATE
-    return CONTRA_DEFAULT
-
-
-def _get_jk_contraindication_multiplier(ingredient_lower: str, jenis_kulit: str,
-                                         jk_contraindication_map: dict) -> float:
-    """
-    Lookup contraindication multiplier untuk ingredient + jenis_kulit tertentu.
-    Menggunakan ULANG konstanta CONTRA_HIGH/MODERATE/LOW/DEFAULT yang sama
-    persis dipakai di axis masalah kulit — bukan skala/parameter baru,
-    hanya diterapkan pada map yang berbeda (Jenis Kulit Contraindication
-    Strength, bukan Masalah Kulit Contraindication Strength).
-    """
-    jk_map = jk_contraindication_map.get(ingredient_lower, {})
-    level = jk_map.get(jenis_kulit, '')
     if level == 'High':
         return CONTRA_HIGH
     elif level == 'Moderate':
@@ -220,11 +186,9 @@ def _audit_evidence_dataset(rules_df: pd.DataFrame, evidence_maps: dict) -> dict
 
     evidence_map = (evidence_maps or {}).get('evidence', {})
     contra_map   = (evidence_maps or {}).get('contraindication', {})
-    jk_contra_map = (evidence_maps or {}).get('jk_contraindication', {})
 
     with_evidence = len(evidence_map)
     with_contra   = len(contra_map)
-    with_jk_contra = len(jk_contra_map)
 
     # Baris dengan nama ingredient yang sama (potensi entri konflik/duplikat)
     lower_names = names.str.lower()
@@ -243,22 +207,14 @@ def _audit_evidence_dataset(rules_df: pd.DataFrame, evidence_maps: dict) -> dict
         for level in mk_map.values():
             contra_level_counts[level] = contra_level_counts.get(level, 0) + 1
 
-    jk_contra_level_counts = {}
-    for jk_map in jk_contra_map.values():
-        for level in jk_map.values():
-            jk_contra_level_counts[level] = jk_contra_level_counts.get(level, 0) + 1
-
     return {
         'total_unique_ingredients': int(total_unique),
         'ingredients_with_evidence_data': with_evidence,
         'ingredients_with_contraindication_data': with_contra,
-        'ingredients_with_jenis_kulit_contraindication_data': with_jk_contra,
         'evidence_coverage_pct': round(with_evidence / total_unique * 100, 1) if total_unique else 0.0,
         'contraindication_coverage_pct': round(with_contra / total_unique * 100, 1) if total_unique else 0.0,
-        'jenis_kulit_contraindication_coverage_pct': round(with_jk_contra / total_unique * 100, 1) if total_unique else 0.0,
         'evidence_level_distribution': evidence_level_counts,
         'contraindication_level_distribution': contra_level_counts,
-        'jenis_kulit_contraindication_level_distribution': jk_contra_level_counts,
         'duplicate_ingredient_rows': [
             {'ingredient': name, 'jumlah_baris': int(count)}
             for name, count in duplicate_ingredients
@@ -267,10 +223,7 @@ def _audit_evidence_dataset(rules_df: pd.DataFrame, evidence_maps: dict) -> dict
             'Audit ini hanya melaporkan kelengkapan & duplikasi data apa adanya. '
             'Tidak ada asumsi default (mis. "selalu High") untuk ingredient mana pun; '
             'level yang tidak tercatat di dataset akan tetap diperlakukan sebagai '
-            'CONTRA_DEFAULT/EVIDENCE_DEFAULT oleh mesin scoring. Kolom Jenis Kulit '
-            'Contraindication Strength baru terisi sebagian — ingredient yang belum '
-            'punya data akan memakai CONTRA_DEFAULT (tidak ada penalty ekstra) untuk '
-            'axis jenis kulit, sampai datanya dilengkapi.'
+            'CONTRA_DEFAULT/EVIDENCE_DEFAULT oleh mesin scoring.'
         ),
     }
 
@@ -477,8 +430,6 @@ def _filter_skin_type(
     jk_cocok_map: dict, jk_tidak_map: dict,
     cache_jk_cocok: dict, cache_jk_tidak: dict,
     jk_cocok_keys: list, jk_tidak_keys: list,
-    jk_contraindication_map: dict = None,
-    jenis_kulit: str = '',
 ) -> dict:
     """
     Rule-Based Filtering Layer 1: Jenis Kulit sebagai eligibility constraint.
@@ -486,34 +437,24 @@ def _filter_skin_type(
     Aturan:
       - Jika ada ingredient di TOP 20% posisi yang "tidak cocok" untuk jenis
         kulit user → produk DITOLAK (hard reject).
-      - Ingredient di posisi >20% yang tidak cocok → warning saja (soft info),
-        DAN dikenakan soft penalty (raw, bukan persen) sebanding dengan bobot
-        posisi × tingkat kontraindikasi jenis kulit (High/Moderate/Low) —
-        menggunakan mekanisme yang identik dengan penalti masalah kulit,
-        hanya map & kolom sumbernya berbeda. Penalty ini TIDAK pernah
-        mempengaruhi hard reject; hard reject tetap murni boolean di top 20%.
+      - Ingredient di posisi >20% yang tidak cocok → warning saja (soft info).
 
     Returns dict:
       {
         'compatible': bool,           # True = lolos filter
         'jk_cocok_list': [...],       # ingredient cocok jenis kulit
-        'jk_warnings': [...],         # ingredient tidak cocok (posisi >20%), tiap entri
-                                       # menyertakan 'contra_level' & 'penalty_efektif' (raw)
+        'jk_warnings': [...],         # ingredient tidak cocok (posisi >20%)
         'jk_hard_reject': [...],      # ingredient tidak cocok (posisi ≤20%)
         'jk_cocok_count': int,
         'jk_tidak_count': int,
-        'penalty_jenis_kulit': float, # total penalty raw dari seluruh jk_warnings
       }
     """
-    jk_contraindication_map = jk_contraindication_map or {}
-
     total = len(ingredients_list)
     if total == 0:
         return {
             'compatible': True,
             'jk_cocok_list': [], 'jk_warnings': [], 'jk_hard_reject': [],
             'jk_cocok_count': 0, 'jk_tidak_count': 0,
-            'penalty_jenis_kulit': 0.0,
         }
 
     seen_cocok = set()
@@ -521,7 +462,6 @@ def _filter_skin_type(
     jk_cocok_list = []
     jk_warnings = []
     jk_hard_reject = []
-    penalty_jenis_kulit = 0.0
 
     for idx, ingr in enumerate(ingredients_list):
         pos_w, neg_w = _bobot_posisi(idx, total)
@@ -547,28 +487,15 @@ def _filter_skin_type(
             orig, alasan = jk_tidak_map[jk_key]
             if orig not in seen_tidak:
                 seen_tidak.add(orig)
+                entry = {
+                    'ingredient': orig,
+                    'alasan': str(alasan) if alasan and str(alasan) != '-' else '-',
+                    'posisi': 'Utama' if is_top20 else ('Menengah' if persen <= 0.5 else 'Minor'),
+                }
                 if is_top20:
-                    jk_hard_reject.append({
-                        'ingredient': orig,
-                        'alasan': str(alasan) if alasan and str(alasan) != '-' else '-',
-                        'posisi': 'Utama',
-                    })
+                    jk_hard_reject.append(entry)
                 else:
-                    # Soft penalty (raw): pos_w yang sama dg _bobot_posisi,
-                    # dikalikan strength kontraindikasi JENIS KULIT (kolom baru).
-                    jk_contra_level = jk_contraindication_map.get(orig.lower(), {}).get(jenis_kulit, '')
-                    jk_contra_mult = _get_jk_contraindication_multiplier(
-                        orig.lower(), jenis_kulit, jk_contraindication_map
-                    )
-                    penalty_efektif = neg_w * jk_contra_mult
-                    penalty_jenis_kulit += penalty_efektif
-                    jk_warnings.append({
-                        'ingredient': orig,
-                        'alasan': str(alasan) if alasan and str(alasan) != '-' else '-',
-                        'posisi': 'Menengah' if persen <= 0.5 else 'Minor',
-                        'contra_level': _contra_label(jk_contra_level),
-                        'penalty_efektif': round(penalty_efektif, 2),
-                    })
+                    jk_warnings.append(entry)
 
     compatible = len(jk_hard_reject) == 0
 
@@ -579,7 +506,6 @@ def _filter_skin_type(
         'jk_hard_reject': jk_hard_reject,
         'jk_cocok_count': len(jk_cocok_list),
         'jk_tidak_count': len(jk_warnings) + len(jk_hard_reject),
-        'penalty_jenis_kulit': round(penalty_jenis_kulit, 2),
     }
 
 
@@ -596,40 +522,33 @@ def _analisis_produk_v3(
     has_masalah: bool,
     evidence_maps: dict = None,
     masalah_kulit: str = '',
-    jenis_kulit: str = '',
 ) -> dict:
     """
-    Analisis satu produk dengan arsitektur v3 (raw score, tanpa normalisasi
-    persentase — lihat catatan di bagian scoring):
+    Analisis satu produk dengan arsitektur v3:
 
     # Mode 1 (has_masalah=True):
-    #   Layer 1: Skin type constraint filter (hard reject, boolean)
-    #   Layer 2: WSM raw dari masalah kulit (efektivitas)
-    #   Layer 3: Soft penalty raw dari jenis kulit (ingredient warning-tier)
-    #   Layer 4: skor akhir = efektivitas − penalty (raw, tidak dinormalisasi)
+    #   Layer 1: Skin type constraint filter (hard/soft)
+    #   Layer 2: WSM scoring dari masalah kulit
 
     Mode 2 — Fallback (has_masalah=False):
-      Tidak ada filter, tidak ada penalty terpisah. Jenis kulit menjadi
-      satu-satunya kriteria WSM (raw), sama seperti sebelumnya.
+      Tidak ada filter. Jenis kulit menjadi kriteria WSM.
+      Semua produk tetap mendapat skor berdasarkan kesesuaian jenis kulit.
     """
     ingredients_list = _parse_ingredients(produk.get('Ingridients', ''))
     total = len(ingredients_list)
     if total == 0:
         return None
 
-    jk_contraindication_map = (evidence_maps or {}).get('jk_contraindication', {})
-
     # ── Tentukan mode scoring ──
-    # Jika ada masalah kulit: jenis kulit = filter + soft penalty, masalah kulit = WSM
-    # Jika TIDAK ada masalah kulit: jenis kulit = WSM (fallback), tidak ada filter/penalty
+    # Jika ada masalah kulit: jenis kulit = filter, masalah kulit = WSM
+    # Jika TIDAK ada masalah kulit: jenis kulit = WSM (fallback), tidak ada filter
     if has_masalah:
-        # Mode 1: Skin type sebagai filter + soft penalty (jenis kulit)
+        # Mode 1: Skin type sebagai filter
         skin_type_info = _filter_skin_type(
             ingredients_list,
             jk_cocok_map, jk_tidak_map,
             cache_jk_cocok, cache_jk_tidak,
             jk_cocok_keys, jk_tidak_keys,
-            jk_contraindication_map, jenis_kulit,
         )
         # WSM maps = masalah kulit
         wsm_cocok_map = mk_cocok_map
@@ -640,12 +559,11 @@ def _analisis_produk_v3(
         wsm_tidak_keys = mk_tidak_keys
         scoring_mode = 'masalah_kulit'
     else:
-        # Mode 2 — Fallback: Skin type sebagai WSM ranking, TIDAK ada filter/penalty
+        # Mode 2 — Fallback: Skin type sebagai WSM ranking, TIDAK ada filter
         skin_type_info = {
             'compatible': True,
             'jk_cocok_list': [], 'jk_warnings': [], 'jk_hard_reject': [],
             'jk_cocok_count': 0, 'jk_tidak_count': 0,
-            'penalty_jenis_kulit': 0.0,
         }
         # WSM maps = jenis kulit (fallback)
         wsm_cocok_map = jk_cocok_map
@@ -656,17 +574,7 @@ def _analisis_produk_v3(
         wsm_tidak_keys = jk_tidak_keys
         scoring_mode = 'jenis_kulit'
 
-    # ── WSM Scoring (RAW — tidak dinormalisasi) ──
-    # Catatan metodologi: sebelumnya skor dinormalisasi ke rentang [-100,100]
-    # dengan membagi terhadap ceiling rule-relevant. Ini dibuang atas
-    # permintaan eksplisit: normalisasi rasio membuat produk dengan sedikit
-    # ingredient cocok (mis. 2 match, semua di posisi favorit) bisa mengalahkan
-    # produk dengan lebih banyak ingredient cocok (mis. 5 match) hanya karena
-    # rasionya lebih "bersih" — padahal kandungan aktif produk kedua lebih
-    # banyak. Skor sekarang adalah akumulasi bobot efektif apa adanya (raw),
-    # sehingga produk dengan lebih banyak bukti dermatologis yang relevan
-    # secara konsisten mendapat skor lebih tinggi, bukan sekadar rasio bersih
-    # dari sedikit data.
+    # ── WSM Scoring ──
     seen_wsm_cocok = set()
     seen_wsm_tidak = set()
 
@@ -675,6 +583,24 @@ def _analisis_produk_v3(
 
     ingredients_detail = []
     score_wsm = 0.0
+
+    # ── Normalisasi denominator: "actual achievable maximum" ──
+    # Revisi metodologi (lihat catatan review): denominator TIDAK lagi
+    # dihitung dari seluruh posisi ingredient (theoretical maximum),
+    # melainkan hanya dari posisi yang benar-benar "rule-relevant" —
+    # yaitu ingredient yang cocok ATAU tidak cocok menurut dataset untuk
+    # jenis_kulit/masalah_kulit user. Ingredient netral (tidak tercatat
+    # di dataset sama sekali) tidak pernah bisa berkontribusi pada
+    # score_wsm, sehingga tidak boleh memperbesar ceiling — kalau tetap
+    # dihitung, produk dengan banyak ingredient netral/filler akan
+    # dirugikan secara sistematis walau kandungan aktifnya identik
+    # (length bias). Ini analog dengan normalisasi ideal-DCG pada IR:
+    # ceiling dihitung atas himpunan item yang relevan/dinilai, bukan
+    # atas seluruh koleksi. Struktur WSM, position weight, evidence,
+    # dan contraindication multiplier TIDAK berubah — hanya cakupan
+    # penjumlahan pada denominator.
+    max_ev = EVIDENCE_PRIMARY if scoring_mode == 'masalah_kulit' else 1.0
+    max_possible = 0.0
 
     # Resolve evidence maps for this analysis
     ev_map = (evidence_maps or {}).get('evidence', {})
@@ -690,6 +616,13 @@ def _analisis_produk_v3(
             k_aliases, wsm_cocok_map, wsm_tidak_map,
             wsm_cache_cocok, wsm_cache_tidak, wsm_cocok_keys, wsm_tidak_keys
         )
+
+        # Ingredient ini rule-relevant (match cocok atau tidak cocok) →
+        # ikut menyumbang ke ceiling normalisasi menggunakan bobot
+        # positif posisinya (karena ceiling merepresentasikan skenario
+        # terbaik: ingredient tersebut cocok dengan evidence maksimal).
+        if wsm_type is not None:
+            max_possible += pos_w * max_ev
 
         if wsm_type == 'cocok':
             orig, manfaat = wsm_cocok_map[wsm_key]
@@ -756,15 +689,13 @@ def _analisis_produk_v3(
 
         ingredients_detail.append({'nama': ingr, 'status': ingr_status})
 
-    # ── Skor akhir: RAW, TIDAK dinormalisasi ke persentase ──
-    # skor_efektivitas = akumulasi bobot efektif dari axis WSM (masalah
-    # kulit, atau jenis kulit di mode fallback) — angka mentah, tidak
-    # dibagi apa pun. Untuk mode masalah kulit, penalty jenis kulit
-    # (raw, dari ingredient warning-tier di Layer 1) dikurangkan di sini,
-    # sebagai komponen TERPISAH dari WSM — bukan dicampur ke score_wsm.
-    skor_efektivitas = score_wsm
-    penalty_jenis_kulit = skin_type_info.get('penalty_jenis_kulit', 0.0) if has_masalah else 0.0
-    final_score = skor_efektivitas - penalty_jenis_kulit
+    # ── Normalize score to [-100, 100] ──
+    if max_possible > 0:
+        norm_score = max(-100.0, min(100.0, (score_wsm / max_possible) * 100))
+    else:
+        norm_score = 0.0
+
+    final_score = norm_score
 
     harga   = produk.get('Harga')
     gambar  = produk.get('Gambar')
@@ -787,14 +718,13 @@ def _analisis_produk_v3(
         'bahan_cocok':        cocok_found,
         'bahan_tidak_cocok':  tidak_found,
         'ingredients_detail': ingredients_detail,
-        'skor':                    round(final_score, 2),          # raw, primary ranking key
-        'skor_efektivitas':        round(skor_efektivitas, 2),     # raw WSM (masalah kulit / fallback jenis kulit)
-        'penalty_jenis_kulit':     round(penalty_jenis_kulit, 2),  # raw penalty (0 kalau mode fallback / tidak ada warning)
-        'skor_masalah':            round(skor_efektivitas, 2),     # alias lama, kini raw (bukan %)
-        'skor_mentah':             round(score_wsm, 2),            # alias lama, sama dgn skor_efektivitas
-        'normalisasi_metode':      'raw_no_normalization',
+        'skor':               round(final_score, 2),
+        'skor_masalah':       round(norm_score, 2),
+        'skor_mentah':        round(score_wsm, 2),
+        'skor_maksimal':      round(max_possible, 2),
+        'normalisasi_metode': 'actual_achievable_max_rule_relevant',
         'scoring_mode':       scoring_mode,
-        # Skin type info (constraint + soft penalty, bukan ranking utama)
+        # Skin type info (constraint, bukan ranking)
         'skin_type_compatible': skin_type_info['compatible'],
         'skin_type_info':       skin_type_info,
         'rekomendasi':        rekomendasi_text,
@@ -915,7 +845,7 @@ def get_recommendations():
             cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
             jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
             has_masalah,
-            evidence_maps, masalah_kulit, jenis_kulit,
+            evidence_maps, masalah_kulit,
         )
         if h:
             if h['skin_type_compatible']:
@@ -1015,7 +945,7 @@ def analyze_ingredients():
         list(jk_cocok_map.keys()), list(jk_tidak_map.keys()),
         list(mk_cocok_map.keys()), list(mk_tidak_map.keys()),
         has_masalah,
-        evidence_maps, masalah_kulit, jenis_kulit,
+        evidence_maps, masalah_kulit,
     )
 
     return jsonify({
@@ -1078,7 +1008,7 @@ def batch_scores():
             cache_jk_cocok, cache_jk_tidak, cache_mk_cocok, cache_mk_tidak,
             jk_cocok_keys, jk_tidak_keys, mk_cocok_keys, mk_tidak_keys,
             has_masalah,
-            evidence_maps, masalah_kulit, jenis_kulit,
+            evidence_maps, masalah_kulit,
         )
         if h:
             ingr_key = ','.join(sorted([i.strip().lower() for i in _parse_ingredients(row.get('Ingridients', ''))]))
