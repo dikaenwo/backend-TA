@@ -689,13 +689,13 @@ def _analisis_produk_v3(
 
         ingredients_detail.append({'nama': ingr, 'status': ingr_status})
 
-    # ── Normalisasi dihapus, menggunakan Raw Score ──
+    # ── Normalize score to [-100, 100] ──
     if max_possible > 0:
         norm_score = max(-100.0, min(100.0, (score_wsm / max_possible) * 100))
     else:
         norm_score = 0.0
 
-    final_score = score_wsm
+    final_score = norm_score
 
     harga   = produk.get('Harga')
     gambar  = produk.get('Gambar')
