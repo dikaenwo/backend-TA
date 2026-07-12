@@ -6,7 +6,7 @@ Algoritma v4 (Rule-Based + WSM Posisi, Tanpa Normalisasi):
   - Disamakan persis dengan algoritma v9 hasil uji coba di Google Colab.
   - Jenis Kulit DAN Masalah Kulit sama-sama dihitung sebagai WSM single-axis
     (bukan lagi filter/constraint) → tidak ada lagi hard-reject.
-  - Skor akhir = rata-rata (skor_wsm Jenis Kulit + skor_wsm Masalah Kulit) / 2
+  - Skor akhir = penjumlahan (skor_wsm Jenis Kulit + skor_wsm Masalah Kulit)
   - Bobot posisi ingredient: atas 20% → +1.0/-2.0, 20-50% → +0.5/-1.0, sisanya → +0.2/-0.5
   - Skor TIDAK dinormalisasi (raw score, sesuai Colab v9 "Tanpa Normalisasi")
   - Tidak ada lagi Evidence/Contraindication Strength multiplier
@@ -27,6 +27,14 @@ import pandas as pd
 import os
 import re
 from difflib import get_close_matches
+
+# rapidfuzz jauh lebih cepat dari difflib untuk fuzzy-matching massal (C-optimized).
+# Fallback otomatis ke difflib kalau library belum terinstall, supaya kode tetap jalan.
+try:
+    from rapidfuzz import fuzz as _rf_fuzz, process as _rf_process
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
 
 recommend_bp = Blueprint('recommend', __name__, url_prefix='/api/recommend')
 
@@ -52,8 +60,18 @@ def _get_data():
         _cache['rules_df']  = rules_df
         _cache['produk_df'] = pd.read_excel(os.path.join(_DATASET, 'Dataset Produk.xlsx'))
 
+        # Precompute rows sekali sebagai list of dict → jauh lebih cepat dipakai
+        # berulang kali dibanding rules_df.iterrows() (overhead pandas per-baris).
+        _cache['rules_records'] = rules_df.to_dict('records')
+
+        # Cache hasil _build_rule_maps_v2 per kombinasi (jenis_kulit, masalah_kulit).
+        # Kombinasinya terbatas (jenis kulit x masalah kulit), jadi tidak perlu
+        # di-rebuild dari 10k+ baris setiap request — cukup sekali per kombinasi.
+        _cache['rule_maps_cache'] = {}
+
         print("[Recommend] Dataset Terbaru.csv & Dataset Produk.xlsx berhasil dimuat.")
         print(f"  Rules: {len(rules_df)} baris | Produk: {len(_cache['produk_df'])} baris")
+        print(f"  Fuzzy matcher: {'rapidfuzz' if _HAS_RAPIDFUZZ else 'difflib (fallback, lebih lambat)'}")
     except Exception as e:
         _cache.clear()
         raise RuntimeError(f"Gagal memuat dataset: {e}") from e
@@ -104,7 +122,7 @@ def _get_aliases(ingr_name: str) -> set:
 
 # ─── Core Scoring Functions (v4 — samakan dengan Colab v9) ──────────────────
 
-def _build_rule_maps_v2(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit: str):
+def _build_rule_maps_v2(rules_records: list, jenis_kulit: str, masalah_kulit: str):
     """
     Build 4 independent maps dari Dataset Terbaru.csv:
       jk_cocok_map : alias → (original_name, alasan)  — cocok for jenis_kulit
@@ -113,13 +131,16 @@ def _build_rule_maps_v2(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit:
       mk_tidak_map : alias → (original_name, alasan)  — tidak cocok for masalah_kulit
 
     Setiap axis independen satu sama lain (tidak ada short-circuit OR).
+
+    rules_records: list of dict hasil rules_df.to_dict('records') — dipakai
+    ketimbang rules_df.iterrows() karena jauh lebih cepat untuk iterasi 10k+ baris.
     """
     jk_cocok_map = {}
     jk_tidak_map = {}
     mk_cocok_map = {}
     mk_tidak_map = {}
 
-    for _, row in rules_df.iterrows():
+    for row in rules_records:
         orig_name = str(row.get('Ingredient', '')).strip()
         if not orig_name or orig_name == 'nan':
             continue
@@ -184,11 +205,55 @@ def _build_rule_maps_v2(rules_df: pd.DataFrame, jenis_kulit: str, masalah_kulit:
     return jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map
 
 
+def _get_rule_maps_cached(data_set: dict, jenis_kulit: str, masalah_kulit: str):
+    """
+    Ambil rule maps dari cache kalau kombinasi (jenis_kulit, masalah_kulit) ini
+    sudah pernah dihitung sebelumnya; kalau belum, build sekali lalu simpan.
+
+    Ini menghindari rebuild dari 10k+ baris rules setiap request — kombinasi
+    jenis_kulit x masalah_kulit jumlahnya terbatas (maks ~24), jadi setelah
+    beberapa request pertama, hampir semua kombinasi sudah di-cache.
+    """
+    key = (jenis_kulit, masalah_kulit)
+    rule_maps_cache = data_set['rule_maps_cache']
+    if key not in rule_maps_cache:
+        rule_maps_cache[key] = _build_rule_maps_v2(
+            data_set['rules_records'], jenis_kulit, masalah_kulit
+        )
+    return rule_maps_cache[key]
+
+
+def _fuzzy_best_match(query: str, keys: list, cutoff: float = 0.85):
+    """
+    Cari kecocokan terbaik untuk `query` di antara `keys` (cutoff 0.0–1.0).
+    Pakai rapidfuzz kalau tersedia (jauh lebih cepat, C-optimized untuk
+    matching massal); fallback ke difflib kalau rapidfuzz belum terinstall.
+
+    Catatan: rapidfuzz.fuzz.ratio dan difflib.SequenceMatcher.ratio memakai
+    algoritma yang sedikit berbeda, jadi ada kemungkinan (jarang) hasil match
+    di sekitar batas cutoff sedikit berbeda antara kedua mode ini.
+    """
+    if not keys:
+        return None
+    if _HAS_RAPIDFUZZ:
+        result = _rf_process.extractOne(
+            query, keys, scorer=_rf_fuzz.ratio, score_cutoff=cutoff * 100
+        )
+        return result[0] if result else None
+    else:
+        fuzz_result = get_close_matches(query, keys, n=1, cutoff=cutoff)
+        return fuzz_result[0] if fuzz_result else None
+
+
 def _match_ingredient(k_aliases, cocok_map, tidak_map,
                       cache_cocok, cache_tidak, cocok_keys, tidak_keys):
     """
     Cocokkan alias ingredient terhadap cocok/tidak map (exact → fuzzy).
     Returns ('cocok', matched_key) atau ('tidak', matched_key) atau (None, None).
+
+    cache_cocok/cache_tidak SEHARUSNYA di-share lintas semua produk dalam satu
+    request (bukan dibuat baru per produk) — supaya ingredient yang sama tidak
+    di-fuzzy-match berulang kali. Ini adalah optimasi performa utama.
     """
     # ── Check Cocok (Exact → Fuzzy) ──
     match_cocok = None
@@ -204,10 +269,10 @@ def _match_ingredient(k_aliases, cocok_map, tidak_map,
                 if match_cocok:
                     break
             else:
-                fuzz = get_close_matches(a, cocok_keys, n=1, cutoff=0.85)
-                cache_cocok[a] = fuzz[0] if fuzz else None
-                if fuzz:
-                    match_cocok = fuzz[0]
+                found = _fuzzy_best_match(a, cocok_keys, cutoff=0.85)
+                cache_cocok[a] = found
+                if found:
+                    match_cocok = found
                     break
 
     if match_cocok:
@@ -227,10 +292,10 @@ def _match_ingredient(k_aliases, cocok_map, tidak_map,
                 if match_tidak:
                     break
             else:
-                fuzz = get_close_matches(a, tidak_keys, n=1, cutoff=0.85)
-                cache_tidak[a] = fuzz[0] if fuzz else None
-                if fuzz:
-                    match_tidak = fuzz[0]
+                found = _fuzzy_best_match(a, tidak_keys, cutoff=0.85)
+                cache_tidak[a] = found
+                if found:
+                    match_tidak = found
                     break
 
     if match_tidak:
@@ -239,18 +304,31 @@ def _match_ingredient(k_aliases, cocok_map, tidak_map,
     return None, None
 
 
-def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict) -> dict:
+def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict,
+                     cache_cocok: dict = None, cache_tidak: dict = None,
+                     cocok_keys: list = None, tidak_keys: list = None) -> dict:
     """
     Hitung skor WSM murni berbasis posisi untuk SATU axis (jenis kulit ATAU
     masalah kulit). Tidak ada normalisasi, tidak ada evidence/contraindication
     multiplier — persis seperti wsm_score_axis() di Colab v9.
+
+    cache_cocok/cache_tidak/cocok_keys/tidak_keys idealnya di-share antar
+    produk dalam satu request (lihat _prepare_axis_caches) supaya fuzzy-match
+    untuk ingredient yang sama tidak dihitung ulang tiap produk. Kalau tidak
+    diberikan (mis. dipanggil sendiri untuk 1 produk saja), dibuat baru.
     """
     total = len(ingredients_list)
     if total == 0:
         return {'skor_raw': 0.0, 'cocok': [], 'tidak': [], 'detail': []}
 
-    cache_cocok, cache_tidak = {}, {}
-    cocok_keys, tidak_keys = list(cocok_map.keys()), list(tidak_map.keys())
+    if cache_cocok is None:
+        cache_cocok = {}
+    if cache_tidak is None:
+        cache_tidak = {}
+    if cocok_keys is None:
+        cocok_keys = list(cocok_map.keys())
+    if tidak_keys is None:
+        tidak_keys = list(tidak_map.keys())
 
     seen_cocok, seen_tidak = set(), set()
     cocok_found, tidak_found = [], []
@@ -299,26 +377,65 @@ def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict) ->
     }
 
 
+def _prepare_axis_caches(jk_cocok_map: dict, jk_tidak_map: dict,
+                          mk_cocok_map: dict, mk_tidak_map: dict) -> dict:
+    """
+    Siapkan cache fuzzy-match + key list SEKALI untuk dipakai bersama oleh
+    semua produk dalam satu request. Ini optimasi performa utama: tanpa ini,
+    setiap produk akan fuzzy-match ulang dari nol meski hasilnya pasti sama
+    untuk ingredient yang sama (mis. "Aqua", "Glycerin" muncul di ratusan produk).
+    """
+    return {
+        'jk': {
+            'cache_cocok': {}, 'cache_tidak': {},
+            'cocok_keys': list(jk_cocok_map.keys()),
+            'tidak_keys': list(jk_tidak_map.keys()),
+        },
+        'mk': {
+            'cache_cocok': {}, 'cache_tidak': {},
+            'cocok_keys': list(mk_cocok_map.keys()),
+            'tidak_keys': list(mk_tidak_map.keys()),
+        },
+    }
+
+
 def _analisis_produk_v4(
     produk: pd.Series,
     jk_cocok_map: dict, jk_tidak_map: dict,
     mk_cocok_map: dict, mk_tidak_map: dict,
+    axis_caches: dict = None,
 ) -> dict:
     """
     Analisis satu produk dengan arsitektur v4 (= Colab v9):
       - Jenis Kulit  → WSM posisi (bukan filter/constraint lagi)
       - Masalah Kulit → WSM posisi
-      - Skor akhir = rata-rata (skor_jk + skor_mk) / 2, TIDAK dinormalisasi.
+      - Skor akhir = skor_jk + skor_mk (penjumlahan langsung), TIDAK dinormalisasi.
       - Tidak ada hard-reject: semua produk tetap dikembalikan.
+
+    axis_caches: hasil _prepare_axis_caches(), di-share antar produk untuk
+    performa. Kalau None, cache dibuat baru khusus untuk 1 produk ini saja
+    (dipakai di endpoint /analyze yang memang cuma 1 produk).
     """
     ingredients_list = _parse_ingredients(produk.get('Ingridients', ''))
     if len(ingredients_list) == 0:
         return None
 
-    hasil_jk = _wsm_score_axis(ingredients_list, jk_cocok_map, jk_tidak_map)
-    hasil_mk = _wsm_score_axis(ingredients_list, mk_cocok_map, mk_tidak_map)
+    if axis_caches is None:
+        axis_caches = _prepare_axis_caches(jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map)
 
-    skor_total = round((hasil_jk['skor_raw'] + hasil_mk['skor_raw']) / 2, 6)
+    jk_c = axis_caches['jk']
+    mk_c = axis_caches['mk']
+
+    hasil_jk = _wsm_score_axis(
+        ingredients_list, jk_cocok_map, jk_tidak_map,
+        jk_c['cache_cocok'], jk_c['cache_tidak'], jk_c['cocok_keys'], jk_c['tidak_keys'],
+    )
+    hasil_mk = _wsm_score_axis(
+        ingredients_list, mk_cocok_map, mk_tidak_map,
+        mk_c['cache_cocok'], mk_c['cache_tidak'], mk_c['cocok_keys'], mk_c['tidak_keys'],
+    )
+
+    skor_total = round(hasil_jk['skor_raw'] + hasil_mk['skor_raw'], 6)
     rekomendasi_text = 'Direkomendasikan' if skor_total > 0 else 'Tidak Direkomendasikan'
 
     harga   = produk.get('Harga')
@@ -383,7 +500,7 @@ def get_recommendations():
 
     Algoritma v4:
       1. Hitung skor WSM posisi untuk axis Jenis Kulit dan axis Masalah Kulit
-      2. Skor akhir = rata-rata kedua axis (tanpa normalisasi, tanpa filter)
+      2. Skor akhir = penjumlahan kedua axis (tanpa normalisasi, tanpa filter)
       3. Urutkan semua produk dari skor tertinggi
     """
     try:
@@ -401,8 +518,8 @@ def get_recommendations():
     if not jenis_kulit:
         return jsonify({'error': 'jenis_kulit wajib diisi.'}), 400
 
-    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _build_rule_maps_v2(
-        data_set['rules_df'], jenis_kulit, masalah_kulit
+    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _get_rule_maps_cached(
+        data_set, jenis_kulit, masalah_kulit
     )
 
     produk_df = data_set['produk_df']
@@ -414,9 +531,12 @@ def get_recommendations():
     if produk_filter.empty:
         return jsonify({'results': [], 'total': 0, 'kategori': kategori}), 200
 
+    # Cache fuzzy-match & key list dibuat SEKALI, dipakai bersama semua produk.
+    axis_caches = _prepare_axis_caches(jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map)
+
     hasil_semua = []
     for _, row in produk_filter.iterrows():
-        h = _analisis_produk_v4(row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map)
+        h = _analisis_produk_v4(row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map, axis_caches)
         if h:
             hasil_semua.append(h)
 
@@ -433,7 +553,7 @@ def get_recommendations():
         'tidak_cocok':   lainnya[:5],
         'filter_info': {
             'method': 'wsm_posisi_dua_axis',
-            'ranking_method': 'rata-rata (skor_jenis_kulit + skor_masalah_kulit) / 2',
+            'ranking_method': 'skor_jenis_kulit + skor_masalah_kulit',
             'normalisasi': 'tidak ada (raw score)',
         },
     }), 200
@@ -498,8 +618,8 @@ def analyze_ingredients():
             'Ingridients': ','.join(ingredients),
         })
 
-    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _build_rule_maps_v2(
-        data_set['rules_df'], jenis_kulit, masalah_kulit
+    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _get_rule_maps_cached(
+        data_set, jenis_kulit, masalah_kulit
     )
 
     hasil = _analisis_produk_v4(dummy_produk, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map)
@@ -541,16 +661,17 @@ def batch_scores():
     if not jenis_kulit:
         return jsonify([])
 
-    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _build_rule_maps_v2(
-        data_set['rules_df'], jenis_kulit, masalah_kulit
+    jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map = _get_rule_maps_cached(
+        data_set, jenis_kulit, masalah_kulit
     )
 
     produk_df = data_set['produk_df']
+    axis_caches = _prepare_axis_caches(jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map)
 
     # Build results: match by normalized ingredients string so frontend can lookup by ingredients
     results = []
     for _, row in produk_df.iterrows():
-        h = _analisis_produk_v4(row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map)
+        h = _analisis_produk_v4(row, jk_cocok_map, jk_tidak_map, mk_cocok_map, mk_tidak_map, axis_caches)
         if h:
             ingr_key = ','.join(sorted([i.strip().lower() for i in _parse_ingredients(row.get('Ingridients', ''))]))
             results.append({
