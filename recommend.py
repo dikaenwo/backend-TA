@@ -145,21 +145,27 @@ def _build_rule_maps_v2(rules_records: list, jenis_kulit: str, masalah_kulit: st
         if not orig_name or orig_name == 'nan':
             continue
 
+        deskripsi = str(row.get('Deskripsi_ID', '') or '').strip()
+        if deskripsi == 'nan':
+            deskripsi = ''
+
         jk_cocok   = str(row.get('Jenis Kulit Cocok', '') or '').strip()
-        alasan_jkc = str(row.get('Alasan Jenis Kulit Cocok', '') or '').strip()
+        alasan_jkc = deskripsi if deskripsi else str(row.get('Alasan Jenis Kulit Cocok', '') or '').strip()
+        
         jk_tidak_raw = row.get('Jenis Kulit Tidak Cocok', None)
         if jk_tidak_raw is None:
             jk_tidak_raw = row.get('Jenis Kulit Hindari', '')
         jk_tidak   = str(jk_tidak_raw or '').strip()
-        alasan_jkt = str(row.get('Alasan Jenis Kulit Tidak Cocok', '') or '').strip()
+        alasan_jkt = deskripsi if deskripsi else str(row.get('Alasan Jenis Kulit Tidak Cocok', '') or '').strip()
 
         mk_cocok   = str(row.get('Masalah Kulit Cocok', '') or '').strip()
-        alasan_mkc = str(row.get('Alasan Masalah Kulit Cocok', '') or '').strip()
+        alasan_mkc = deskripsi if deskripsi else str(row.get('Alasan Masalah Kulit Cocok', '') or '').strip()
+        
         mk_tidak_raw = row.get('Masalah Kulit Tidak Cocok', None)
         if mk_tidak_raw is None:
             mk_tidak_raw = row.get('Masalah Kulit Hindari', '')
         mk_tidak   = str(mk_tidak_raw or '').strip()
-        alasan_mkt = str(row.get('Alasan Masalah Kulit Tidak Cocok', '') or '').strip()
+        alasan_mkt = deskripsi if deskripsi else str(row.get('Alasan Masalah Kulit Tidak Cocok', '') or '').strip()
 
         # Parse comma-separated values
         jk_cocok_list = [x.strip() for x in jk_cocok.split(',') if x.strip() and x.strip() != '-']
