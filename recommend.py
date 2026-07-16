@@ -8,7 +8,7 @@ Algoritma v4 (Rule-Based + WSM Posisi, Tanpa Normalisasi):
     (bukan lagi filter/constraint) → tidak ada lagi hard-reject.
   - Skor akhir = penjumlahan (skor_wsm Jenis Kulit + skor_wsm Masalah Kulit)
   - Bobot posisi ingredient: atas 20% → +1.0/-2.0, 20-50% → +0.5/-1.0, sisanya → +0.2/-0.5
-  - Skor TIDAK dinormalisasi (raw score, sesuai Colab v9 "Tanpa Normalisasi")
+  - Skor menggunakan Laplace Smoothing WSM 3 Kriteria (C1: Jenis Kulit, C2: Masalah Kulit, C3: Posisi)
   - Tidak ada lagi Evidence/Contraindication Strength multiplier
   - Alias ingredient = nama lengkap ingredient itu sendiri saja (tidak ada lagi
     pemecahan berdasarkan '/' atau '(...)', karena di dataset ini tanda '/'
@@ -126,6 +126,7 @@ def _build_rule_maps_v2(rules_records: list, jenis_kulit: str, masalah_kulit: st
     """
     Build 4 independent maps dari Dataset Terbaru.csv:
       jk_cocok_map : alias → (original_name, alasan)  — cocok for jenis_kulit
+      mk_cocok_map : alias → (original_name, alasan)  — cocok for masalah_kulit
       jk_tidak_map : alias → (original_name, alasan)  — tidak cocok for jenis_kulit
       mk_cocok_map : alias → (original_name, alasan)  — cocok for masalah_kulit
       mk_tidak_map : alias → (original_name, alasan)  — tidak cocok for masalah_kulit
@@ -325,7 +326,8 @@ def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict,
     """
     total = len(ingredients_list)
     if total == 0:
-        return {'skor_raw': 0.0, 'cocok': [], 'tidak': [], 'detail': []}
+        return {'skor_raw': 0.0, 'skor_pos': 0.0, 'skor_neg': 0.0, 'cocok': [], 'tidak': [], 'detail': []}
+
 
     if cache_cocok is None:
         cache_cocok = {}
@@ -340,6 +342,8 @@ def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict,
     cocok_found, tidak_found = [], []
     ingredients_detail = []
     score = 0.0
+    skor_pos_acc = 0.0   # akumulasi bobot positif (untuk Laplace)
+    skor_neg_acc = 0.0   # akumulasi bobot negatif (untuk Laplace)
 
     for idx, ingr in enumerate(ingredients_list):
         pos_w, neg_w = _bobot_posisi(idx, total)
@@ -355,6 +359,7 @@ def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict,
             if orig not in seen_cocok:
                 seen_cocok.add(orig)
                 score += pos_w
+                skor_pos_acc += pos_w
                 cocok_found.append({
                     'ingredient': orig,
                     'bobot': round(pos_w, 6),
@@ -366,6 +371,7 @@ def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict,
             if orig not in seen_tidak:
                 seen_tidak.add(orig)
                 score -= neg_w
+                skor_neg_acc += neg_w
                 tidak_found.append({
                     'ingredient': orig,
                     'bobot': round(-neg_w, 6),
@@ -377,10 +383,13 @@ def _wsm_score_axis(ingredients_list: list, cocok_map: dict, tidak_map: dict,
 
     return {
         'skor_raw': round(score, 6),
+        'skor_pos': round(skor_pos_acc, 6),
+        'skor_neg': round(skor_neg_acc, 6),
         'cocok': cocok_found,
         'tidak': tidak_found,
         'detail': ingredients_detail,
     }
+
 
 
 def _prepare_axis_caches(jk_cocok_map: dict, jk_tidak_map: dict,
@@ -412,11 +421,7 @@ def _analisis_produk_v4(
     axis_caches: dict = None,
 ) -> dict:
     """
-    Analisis satu produk dengan arsitektur v4 (= Colab v9):
-      - Jenis Kulit  → WSM posisi (bukan filter/constraint lagi)
-      - Masalah Kulit → WSM posisi
-      - Skor akhir = skor_jk + skor_mk (penjumlahan langsung), TIDAK dinormalisasi.
-      - Tidak ada hard-reject: semua produk tetap dikembalikan.
+    Analisis satu produk dengan WSM 3 Kriteria + Laplace Smoothing
 
     axis_caches: hasil _prepare_axis_caches(), di-share antar produk untuk
     performa. Kalau None, cache dibuat baru khusus untuk 1 produk ini saja
@@ -441,8 +446,22 @@ def _analisis_produk_v4(
         mk_c['cache_cocok'], mk_c['cache_tidak'], mk_c['cocok_keys'], mk_c['tidak_keys'],
     )
 
-    skor_total = round(hasil_jk['skor_raw'] + hasil_mk['skor_raw'], 6)
-    rekomendasi_text = 'Direkomendasikan' if skor_total > 0 else 'Tidak Direkomendasikan'
+    # ── WSM 3 Kriteria (C1, C2, C3) ──────────────────────────────────────────
+    # C1: Jenis Kulit, C2: Masalah Kulit, C3: Posisi (combined)
+    # Disini kita adaptasi logika ke Laplace Smoothing:
+    # Skor = 0.35 * C1 + 0.40 * C2 + 0.25 * C3
+    # (Menggunakan hasil_jk dan hasil_mk)
+
+    def _laplace(b, p):
+        return (b + 1.0) / (b + p + 2.0)
+
+    c1 = _laplace(hasil_jk['skor_pos'], hasil_jk['skor_neg'])
+    c2 = _laplace(hasil_mk['skor_pos'], hasil_mk['skor_neg'])
+    # C3 = simplified based on relevance
+    c3 = _laplace(hasil_jk['skor_pos'] + hasil_mk['skor_pos'], hasil_jk['skor_neg'] + hasil_mk['skor_neg'])
+
+    skor_total = 0.35 * c1 + 0.40 * c2 + 0.25 * c3
+    rekomendasi_text = 'Sangat Direkomendasikan' if skor_total >= 0.65 else ('Cukup Direkomendasikan' if skor_total >= 0.52 else 'Tidak Direkomendasikan')
 
     harga   = produk.get('Harga')
     gambar  = produk.get('Gambar')
@@ -459,9 +478,11 @@ def _analisis_produk_v4(
         # Skor per-axis (samakan istilah dengan Colab)
         'skor_jenis_kulit':   hasil_jk['skor_raw'],
         'skor_masalah_kulit': hasil_mk['skor_raw'],
-        'skor_total':         skor_total,
-        'skor':                skor_total,  # alias, dipakai kode lama/frontend
+        'skor_total':         round(skor_total, 4),
+        'skor':               round(skor_total, 4),
+        'match_pct':          int(skor_total * 100),
         'rekomendasi':        rekomendasi_text,
+        'wsm_detail':         {'C1': round(c1, 4), 'C2': round(c2, 4), 'C3': round(c3, 4)},
         # Detail per-axis, sama struktur dengan detail_store Colab
         'jenis_kulit_detail':   hasil_jk,
         'masalah_kulit_detail': hasil_mk,
