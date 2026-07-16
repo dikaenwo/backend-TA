@@ -50,12 +50,80 @@ VALID_JENIS_KULIT   = {'Normal', 'Berminyak', 'Kering', 'Kombinasi'}
 VALID_MASALAH_KULIT = {'Berjerawat', 'PIE', 'PIH', 'Aging', 'Kusam', 'Kemerahan'}
 
 
+def _adapt_new_to_wide(rules_df_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    Konversi dataset format BARU (long / one-row-per-rule) → format WIDE lama
+    supaya sisa kode di recommend.py (yang mengasumsikan skema lama) tetap jalan.
+
+    Format BARU (dataset TA terbaru):
+      ingredient_name | domain (skin_type|concern) | target | polarity (positif|negatif)
+      | badge_text | ...
+
+    Format WIDE (lama) yang dihasilkan:
+      Ingredient | Jenis Kulit Cocok | Jenis Kulit Tidak Cocok
+                 | Masalah Kulit Cocok | Masalah Kulit Tidak Cocok
+                 | Deskripsi_ID
+    """
+    df = rules_df_long.copy()
+    df['ingredient_name'] = df['ingredient_name'].astype(str).str.strip()
+    df['domain']   = df['domain'].astype(str).str.strip().str.lower()
+    df['polarity'] = df['polarity'].astype(str).str.strip().str.lower()
+    df['target']   = df['target'].astype(str).str.strip()
+
+    # Buang baris kosong / nan
+    df = df[(df['ingredient_name'] != '') & (df['ingredient_name'].str.lower() != 'nan')]
+    df = df[(df['target'] != '') & (df['target'].str.lower() != 'nan')]
+
+    def _agg(mask) -> pd.Series:
+        return (
+            df[mask]
+            .groupby('ingredient_name')['target']
+            .apply(lambda s: ', '.join(sorted({x for x in s if x and x.lower() != 'nan'})))
+        )
+
+    m_jk_cocok  = (df['domain'] == 'skin_type') & (df['polarity'] == 'positif')
+    m_jk_tidak  = (df['domain'] == 'skin_type') & (df['polarity'] == 'negatif')
+    m_mk_cocok  = (df['domain'] == 'concern')   & (df['polarity'] == 'positif')
+    m_mk_tidak  = (df['domain'] == 'concern')   & (df['polarity'] == 'negatif')
+
+    jk_cocok = _agg(m_jk_cocok).rename('Jenis Kulit Cocok')
+    jk_tidak = _agg(m_jk_tidak).rename('Jenis Kulit Tidak Cocok')
+    mk_cocok = _agg(m_mk_cocok).rename('Masalah Kulit Cocok')
+    mk_tidak = _agg(m_mk_tidak).rename('Masalah Kulit Tidak Cocok')
+
+    # Deskripsi = badge_text pertama yang tersedia per ingredient (opsional)
+    if 'badge_text' in df.columns:
+        desc = (
+            df.assign(_bt=df['badge_text'].astype(str).str.strip())
+              .query("_bt != '' and _bt != 'nan'")
+              .groupby('ingredient_name')['_bt']
+              .first()
+              .rename('Deskripsi_ID')
+        )
+    else:
+        desc = pd.Series(dtype=str, name='Deskripsi_ID')
+
+    wide = pd.concat([jk_cocok, jk_tidak, mk_cocok, mk_tidak, desc], axis=1).fillna('')
+    wide.index.name = 'Ingredient'
+    wide = wide.reset_index()
+    return wide
+
+
 def _get_data():
     """Load dataset sekali lalu cache. Raise RuntimeError jika gagal."""
     if _cache:
         return _cache
     try:
-        rules_df = pd.read_csv(os.path.join(_DATASET, 'Dataset Terbaru.csv'))
+        rules_raw = pd.read_csv(os.path.join(_DATASET, 'Dataset Terbaru.csv'), low_memory=False)
+
+        # Deteksi format: BARU (long) vs LAMA (wide).
+        if 'ingredient_name' in rules_raw.columns and 'domain' in rules_raw.columns:
+            rules_df = _adapt_new_to_wide(rules_raw)
+            _fmt = f"BARU (long → wide, {len(rules_raw)} rules → {len(rules_df)} ingredients)"
+        else:
+            rules_df = rules_raw
+            _fmt = f"LAMA (wide, {len(rules_df)} ingredients)"
+
         rules_df['Ingredient'] = rules_df['Ingredient'].astype(str).str.strip()
         _cache['rules_df']  = rules_df
         _cache['produk_df'] = pd.read_excel(os.path.join(_DATASET, 'Dataset Produk.xlsx'))
@@ -63,6 +131,7 @@ def _get_data():
         # Precompute rows sekali sebagai list of dict → jauh lebih cepat dipakai
         # berulang kali dibanding rules_df.iterrows() (overhead pandas per-baris).
         _cache['rules_records'] = rules_df.to_dict('records')
+        _cache['dataset_format'] = _fmt
 
         # Cache hasil _build_rule_maps_v2 per kombinasi (jenis_kulit, masalah_kulit).
         # Kombinasinya terbatas (jenis kulit x masalah kulit), jadi tidak perlu
