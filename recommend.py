@@ -135,12 +135,26 @@ def _get_data():
 
         # Cache hasil _build_rule_maps_v2 per kombinasi (jenis_kulit, masalah_kulit).
         # Kombinasinya terbatas (jenis kulit x masalah kulit), jadi tidak perlu
-        # di-rebuild dari 10k+ baris setiap request — cukup sekali per kombinasi.
+        # di-rebuild dari 10k+ baris rules setiap request — cukup sekali per kombinasi.
         _cache['rule_maps_cache'] = {}
 
         print("[Recommend] Dataset Terbaru.csv & Dataset Produk.xlsx berhasil dimuat.")
-        print(f"  Rules: {len(rules_df)} baris | Produk: {len(_cache['produk_df'])} baris")
-        print(f"  Fuzzy matcher: {'rapidfuzz' if _HAS_RAPIDFUZZ else 'difflib (fallback, lebih lambat)'}")
+        print(f"  Rules: {len(rules_df)} baris ({_fmt}) | Produk: {len(_cache['produk_df'])} baris")
+        print(f"  Fuzzy matcher: {'rapidfuzz (fast, C-optimized)' if _HAS_RAPIDFUZZ else 'difflib (fallback, LEBIH LAMBAT — install rapidfuzz!)'}")
+
+        # ── Pre-warm rule maps untuk SEMUA kombinasi (jenis_kulit × masalah_kulit)
+        # supaya request pertama tidak perlu build dari 10k+ baris rules.
+        # Total 4 × 6 = 24 kombinasi, hanya butuh beberapa detik di startup.
+        import time as _time
+        _t0 = _time.time()
+        _combos = [(jk, mk) for jk in VALID_JENIS_KULIT for mk in VALID_MASALAH_KULIT]
+        _combos += [(jk, '') for jk in VALID_JENIS_KULIT]  # tanpa masalah kulit juga
+        for _jk, _mk in _combos:
+            _cache['rule_maps_cache'][(_jk, _mk)] = _build_rule_maps_v2(
+                _cache['rules_records'], _jk, _mk
+            )
+        print(f"  Pre-warmed {len(_combos)} rule-map combinations in {_time.time()-_t0:.2f}s")
+
     except Exception as e:
         _cache.clear()
         raise RuntimeError(f"Gagal memuat dataset: {e}") from e
